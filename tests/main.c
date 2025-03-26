@@ -50,25 +50,14 @@ static void do_produce(Queue *queue) {
         fprintf(stderr, "New item failure\n");
         return;
     }
-    item->data = (char*)malloc(32);
+    item->data = (char*)malloc(10);
     if (!item->data) {
         fprintf(stderr, "New data failure\n");
         free(item);
         return;
     }
-    memset(item->data, 0, 32);
-    fprintf(stderr, "producer fuck %d\n", g_count);
-    // sprintf(buf, "libco");
-    sprintf((char *)item->data, "libco");
-    // strncpy((char *)item->data, "libco", 31);
-    // *((char *)item->data) = 'l';
-    // *((char *)item->data + 1) = 'i';
-    // *((char *)item->data + 2) = 'b';
-    // *((char *)item->data + 3) = 'c';
-    // *((char *)item->data + 4) = 'o';
-
-
-    fprintf(stderr, "producer fuck %d\n", g_count);
+    memset(item->data, 0, 10);
+    sprintf((char *)item->data, "libco-%d", g_count++);
     q_push(queue, item);
 }
 

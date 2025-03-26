@@ -12,7 +12,7 @@ stack_switch_call(void *sp, void *entry, uintptr_t arg) {
 #if __x86_64__
         "movq %0, %%rsp; movq %2, %%rdi; jmp *%1"
           :
-          : "b"((uintptr_t)sp),
+          : "b"((uintptr_t)sp - 8),
             "d"(entry),
             "a"(arg)
           : "memory"
@@ -27,7 +27,7 @@ stack_switch_call(void *sp, void *entry, uintptr_t arg) {
     );
 }
 
-#define DEBUG
+// #define DEBUG
 
 #ifdef DEBUG
 #define debug(fmt, ...) fprintf(stderr, "\033[90m[debug] " fmt "\033[0m", ##__VA_ARGS__)
@@ -40,7 +40,7 @@ stack_switch_call(void *sp, void *entry, uintptr_t arg) {
     exit(1); \
 } while (0)
 
-#define CO_STACK_SIZE (256 * 1024) // 128KB
+#define CO_STACK_SIZE (32 * 1024) // 32KB
 #define MAX_CO_NUM 1024
 
 void co_wrapper(struct co *co);
@@ -145,7 +145,8 @@ void co_schedule() {
     } else {
         panic("co status is %d\n", current->status);
     }
-    longjmp(current->context, 1);
+    panic("should never reach here");
+    // longjmp(current->context, 1);
 }
 
 void co_wrapper(struct co *co) {
