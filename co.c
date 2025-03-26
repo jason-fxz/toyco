@@ -1,11 +1,12 @@
 #include "co.h"
-#include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <setjmp.h>
 #include <string.h>
 
+// this function is used to switch stack and start a function on the new stack
+//   ! this function never return
 static inline void
 stack_switch_call(void *sp, void *entry, uintptr_t arg) {
     asm volatile (
@@ -40,6 +41,13 @@ stack_switch_call(void *sp, void *entry, uintptr_t arg) {
     exit(1); \
 } while (0)
 
+#define assert(cond) do { \
+    if (!(cond)) { \
+        panic("assertion failed: %s\n", #cond); \
+    } \
+} while (0)
+
+#define CO_RUNTIME_STACK_SIZE (4 * 1024) // 4KB
 #define CO_STACK_SIZE (32 * 1024) // 32KB
 #define MAX_CO_NUM 1024
 
@@ -61,9 +69,7 @@ struct co {
     enum co_status status;  // 协程的状态
     struct co *    waiter;  // 是否有其他协程在等待当前协程
     jmp_buf        context; // 寄存器现场
-    uint8_t        stack_begin[0]; // 用于获取 stack 的起始
-    uint8_t        stack[CO_STACK_SIZE]; // 协程的堆栈
-    uint8_t        stack_end[0]; // 用于获取 stack 的末尾
+    uint8_t        *stack;  // 协程的堆栈
 };
 
 struct co_table {
@@ -105,6 +111,7 @@ struct co* co_current;
 #define current (co_current)
 
 static struct co main_co;
+uint8_t co_runtime_stack[CO_RUNTIME_STACK_SIZE]; // 用于 runtime 的栈
 
 __attribute__((constructor))
 static void co_init() {
@@ -120,6 +127,7 @@ static void co_init() {
     main_co.arg = NULL;
     main_co.status = CO_RUNNING;
     main_co.waiter = NULL;
+    main_co.stack = NULL; // 主协程不需要堆栈(直接使用系统堆栈)
     
     // 设置当前协程为主协程
     co_current = &main_co;
@@ -149,21 +157,25 @@ void co_schedule() {
     // longjmp(current->context, 1);
 }
 
+void co_dead_handle(struct co *co) {
+    co->status = CO_DEAD;
+    free(co->stack); // 释放堆栈
+    co->stack = NULL;
+    co_table_del_co(&co_run_table, co);
+    co_table_add(&co_dead_table, co);
+    if (co->waiter) {
+        co->waiter->status = CO_RUNNING;
+        co_table_del_co(&co_wait_table, co->waiter);
+        co_table_add(&co_run_table, co->waiter);
+    }
+    co_schedule();
+}
+
 void co_wrapper(struct co *co) {
     co->status = CO_RUNNING;
     debug("co_wrapper: %s\n", co->name);
     co->func(co->arg);
-    // panic("co_wrapper: debug\n");
-
-    current->status = CO_DEAD;
-    co_table_del_co(&co_run_table, current);
-    co_table_add(&co_dead_table, current);
-    if (current->waiter) {
-        current->waiter->status = CO_RUNNING;
-        co_table_del_co(&co_wait_table, current->waiter);
-        co_table_add(&co_run_table, current->waiter);
-    }
-    co_schedule();
+    stack_switch_call(co_runtime_stack + CO_RUNTIME_STACK_SIZE, co_dead_handle, (uintptr_t)co);
 }
 
 
@@ -171,15 +183,25 @@ struct co *co_start(const char *name, void (*func)(void *), void *arg) {
     struct co *co = (struct co *)malloc(sizeof(struct co));
     debug("co_start: %s\n", name);
     if (co == NULL) {
-        panic("co_start: malloc failed\n");
+        panic("malloc co_struct failed\n");
         return NULL;
     }
     
-    co->name = (char *)name;
+    co->name = (char *)malloc(strlen(name) + 1);
+    if (co->name == NULL) {
+        panic("malloc co->name failed\n");
+        return NULL;
+    }
+    strcpy(co->name, name);
     co->func = func;
     co->arg = arg;
     co->status = CO_NEW;
     co->waiter = NULL;
+    co->stack = (uint8_t *)malloc(CO_STACK_SIZE);
+    if (co->stack == NULL) {
+        panic("malloc stack failed\n");
+        return NULL;
+    }
     
     co_table_add(&co_run_table, co);
 
@@ -212,5 +234,33 @@ void co_yield() {
         return ;
     }
 }
+
+void co_free(struct co *co) {
+    if (!co || co == &main_co) return;
+    if (co->name) {
+        free(co->name);
+        co->name = NULL;
+    }
+    if (co->stack) {
+        free(co->stack);
+        co->stack = NULL;
+    }
+    free(co);
+}
+
+__attribute__((destructor))
+static void co_main_exit() {
+    debug("co main exit\n");
+    for (int i = 0; i < co_run_table.num; i++) {
+        co_free(co_run_table.tab[i]);
+    }
+    for (int i = 0; i < co_wait_table.num; i++) {
+        co_free(co_wait_table.tab[i]);
+    }
+    for (int i = 0; i < co_dead_table.num; i++) {
+        co_free(co_dead_table.tab[i]);
+    }
+}
+
 
 #undef current
