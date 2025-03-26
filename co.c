@@ -1,3 +1,4 @@
+#include "list.h"
 #include "co.h"
 #include <stdint.h>
 #include <stdlib.h>
@@ -61,13 +62,18 @@ enum co_status {
     CO_DEAD,    // 已经结束，但还未释放资源
 };
 
+struct co_list_node {
+    struct list_head node;
+    struct co *co;
+};
+
 struct co {
     char *name;
     void (*func)(void *); // co_start 指定的入口地址和参数
     void *arg;
     
     enum co_status status;  // 协程的状态
-    struct co *    waiter;  // 是否有其他协程在等待当前协程
+    struct list_head waiters; // 当前协程在等待哪些协程
     jmp_buf        context; // 寄存器现场
     uint8_t        *stack;  // 协程的堆栈
 };
@@ -126,7 +132,7 @@ static void co_init() {
     main_co.func = NULL;
     main_co.arg = NULL;
     main_co.status = CO_RUNNING;
-    main_co.waiter = NULL;
+    INIT_LIST_HEAD(&main_co.waiters);
     main_co.stack = NULL; // 主协程不需要堆栈(直接使用系统堆栈)
     
     // 设置当前协程为主协程
@@ -158,15 +164,19 @@ void co_schedule() {
 }
 
 void co_dead_handle(struct co *co) {
+    struct co_list_node *entry, *tmp;
     co->status = CO_DEAD;
     free(co->stack); // 释放堆栈
     co->stack = NULL;
     co_table_del_co(&co_run_table, co);
     co_table_add(&co_dead_table, co);
-    if (co->waiter) {
-        co->waiter->status = CO_RUNNING;
-        co_table_del_co(&co_wait_table, co->waiter);
-        co_table_add(&co_run_table, co->waiter);
+
+    list_for_each_entry_safe(entry, tmp, &co->waiters, node) {
+        co_table_del_co(&co_wait_table, entry->co);
+        co_table_add(&co_run_table, entry->co);
+        list_del(&entry->node);
+        entry->co->status = CO_RUNNING;
+        free(entry);
     }
     co_schedule();
 }
@@ -196,7 +206,7 @@ struct co *co_start(const char *name, void (*func)(void *), void *arg) {
     co->func = func;
     co->arg = arg;
     co->status = CO_NEW;
-    co->waiter = NULL;
+    INIT_LIST_HEAD(&co->waiters);
     co->stack = (uint8_t *)malloc(CO_STACK_SIZE);
     if (co->stack == NULL) {
         panic("malloc stack failed\n");
@@ -217,8 +227,14 @@ void co_wait(struct co *co) {
         return ;
     }
     current->status = CO_WAITING;
-    co->waiter = current;
-    
+    struct co_list_node *node = (struct co_list_node *)malloc(sizeof(struct co_list_node));
+    if (node == NULL) {
+        panic("malloc co_list_node failed\n");
+        return ;
+    }
+    node->co = current;
+    list_add(&node->node, &co->waiters);
+
     co_table_del_co(&co_run_table, current);
     co_table_add(&co_wait_table, current);
     debug("co_wait: %s (%s) -> yield\n", co->name, current->name);
