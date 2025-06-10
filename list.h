@@ -18,6 +18,13 @@
  * using the generic single-entry routines.
  */
 
+#ifndef _LIST_H_
+#define _LIST_H_
+
+#define POISON_BASE ((void*)0xdead0000)
+#define LIST_POISON1 (POISON_BASE + 0x00000100)
+#define LIST_POISON2 (POISON_BASE + 0x00000200)
+
 struct list_head {
 	struct list_head *next, *prev;
 };
@@ -37,43 +44,43 @@ struct list_head {
  * This is only for internal list manipulation where we know
  * the prev/next entries already!
  */
-static inline void __list_add(struct list_head *new,
+static inline void __list_add(struct list_head *new_,
 			      struct list_head *prev,
 			      struct list_head *next)
 {
-	next->prev = new;
-	new->next = next;
-	new->prev = prev;
-	prev->next = new;
+	next->prev = new_;
+	new_->next = next;
+	new_->prev = prev;
+	prev->next = new_;
 }
 
 /**
  * list_add - add a new entry
- * @new: new entry to be added
+ * @new_: new entry to be added
  * @head: list head to add it after
  *
  * Insert a new entry after the specified head.
  * This is good for implementing stacks.
  */
-static inline void list_add(struct list_head *new, struct list_head *head)
+static inline void list_add(struct list_head *new_, struct list_head *head)
 {
-	__list_add(new, head, head->next);
+	__list_add(new_, head, head->next);
 }
 
 /**
  * list_add_tail - add a new entry
- * @new: new entry to be added
+ * @new_: new entry to be added
  * @head: list head to add it before
  *
  * Insert a new entry before the specified head.
  * This is useful for implementing queues.
  */
-static inline void list_add_tail(struct list_head *new, struct list_head *head)
+static inline void list_add_tail(struct list_head *new_, struct list_head *head)
 {
-	__list_add(new, head->prev, head);
+	__list_add(new_, head->prev, head);
 }
 
-/*
+/**
  * Delete a list entry by making the prev/next entries
  * point to each other.
  *
@@ -94,8 +101,8 @@ static inline void __list_del(struct list_head *prev, struct list_head *next)
 static inline void list_del(struct list_head *entry)
 {
 	__list_del(entry->prev, entry->next);
-	entry->next = (void *) 0;
-	entry->prev = (void *) 0;
+	entry->next = LIST_POISON1;
+	entry->prev = LIST_POISON2;
 }
 
 /**
@@ -191,6 +198,28 @@ static inline void list_splice_init(struct list_head *list,
 	((type *)((char *)(ptr)-(unsigned long)(&((type *)0)->member)))
 
 /**
+ * list_first_entry - get the first element from a list
+ * @ptr:	the list head to take the element from.
+ * @type:	the type of the struct this is embedded in.
+ * @member:	the name of the list_head within the struct.
+ *
+ * Note, that list is expected to be not empty.
+ */
+#define list_first_entry(ptr, type, member) \
+	list_entry((ptr)->next, type, member)
+
+/**
+ * list_last_entry - get the last element from a list
+ * @ptr:	the list head to take the element from.
+ * @type:	the type of the struct this is embedded in.
+ * @member:	the name of the list_head within the struct.
+ * 
+ * Note, that list is expected to be not empty.
+ */
+#define list_last_entry(ptr, type, member) \
+	list_entry((ptr)->prev, type, member)
+
+/**
  * list_for_each	-	iterate over a list
  * @pos:	the &struct list_head to use as a loop counter.
  * @head:	the head for your list.
@@ -240,3 +269,6 @@ static inline void list_splice_init(struct list_head *list,
 		n = list_entry(pos->member.next, typeof(*pos), member);	\
 	     &pos->member != (head); 					\
 	     pos = n, n = list_entry(n->member.next, typeof(*n), member))
+
+
+#endif /* _LIST_H_ */
