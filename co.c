@@ -51,14 +51,14 @@ static size_t next_coid(void) {
 
 // wrapper to handle coroutine execution
 static void co_wrapper(struct co *g) {
-    debug("co_wrapper: starting %s (coid=%ld)\n", g->name, g->coid);
+    debug("co_wrapper: starting G%ld (%s)\n", g->coid, g->name);
     co_set_status(g, CO_RUNNING);
     
     // execute
     g->func(g->arg);
     
     // dead
-    debug("co_wrapper: %s finished\n", g->name);
+    debug("co_wrapper: G%ld finished\n", g->coid);
     co_set_status(g, CO_DEAD);
     pthread_mutex_lock(&g_sched.dead_co_lock);
     list_add_tail(&g->node, &g_sched.dead_co_list);
@@ -67,24 +67,22 @@ static void co_wrapper(struct co *g) {
 
     
     // call waiters
-    struct co_list_node *entry, *tmp;
+    struct co *entry, *tmp;
     pthread_mutex_lock(&g->waiters_lock);
     list_for_each_entry_safe(entry, tmp, &g->waiters, node) {
-        struct co *waiter = entry->co;
-        co_set_status(waiter, CO_RUNABLE);
+        co_set_status(entry, CO_RUNABLE);
         
         assert(current_p);
         pthread_mutex_lock(&current_p->queue_lock);
-        atomic_fetch_sub(&waiter->p->waitq_size, 1);
-        list_move(&waiter->node, &current_p->run_queue);
-        atomic_fetch_add(&current_p->runq_size, 1);
-        pthread_mutex_unlock(&current_p->queue_lock);
         
-        list_del(&entry->node);
-        free(entry);
+        atomic_fetch_sub(&g->waitq_size, 1);
+        list_move(&entry->node, &current_p->run_queue);
+        atomic_fetch_add(&current_p->runq_size, 1);
+
+        pthread_mutex_unlock(&current_p->queue_lock);
     }
     pthread_mutex_unlock(&g->waiters_lock);
-    
+
     co_schedule();
 }
 
@@ -112,7 +110,7 @@ static struct co* runq_get(struct P *p) {
     }
     
     struct co *g = list_first_entry(&p->run_queue, struct co, node);
-    list_del(&g->node);
+    list_del_init(&g->node);
     atomic_fetch_sub(&p->runq_size, 1);
     pthread_mutex_unlock(&p->queue_lock);
     
@@ -143,7 +141,7 @@ static struct co* global_runq_get(void) {
     }
     
     struct co *g = list_first_entry(&g_sched.global_runq, struct co, node);
-    list_del(&g->node);
+    list_del_init(&g->node);
     atomic_fetch_sub(&g_sched.global_runq_size, 1);
     pthread_mutex_unlock(&g_sched.global_runq_lock);
 
@@ -209,7 +207,7 @@ static struct P* p_get_idle(void) {
     }
     
     struct P *p = list_first_entry(&g_sched.idle_p_list, struct P, idle_node);
-    list_del(&p->idle_node);
+    list_del_init(&p->idle_node);
     atomic_fetch_sub(&g_sched.npidle, 1);
     pthread_mutex_unlock(&g_sched.idle_p_lock);
     
@@ -357,7 +355,15 @@ void scheduler_init(void) {
     memset(&g_sched, 0, sizeof(g_sched));
     
     // 设置默认参数
-    g_sched.num_p = COMAXPROCS_DEFAULT;
+    char *max_procs_env = getenv("COMAXPROCS");
+    if (max_procs_env) {
+        g_sched.num_p = atoi(max_procs_env);
+        if (g_sched.num_p <= 0) {
+            panic("COMAXPROCS must be a positive integer\n");
+        }
+    } else {
+        g_sched.num_p = COMAXPROCS_DEFAULT; // 默认值
+    }
     
     // 初始化全局队列
     INIT_LIST_HEAD(&g_sched.global_runq);
@@ -395,10 +401,8 @@ void scheduler_init(void) {
         p->status = P_IDLE;
 
         INIT_LIST_HEAD(&p->run_queue);
-        INIT_LIST_HEAD(&p->wait_queue);
         pthread_mutex_init(&p->queue_lock, NULL);
         atomic_store(&p->runq_size, 0);
-        atomic_store(&p->waitq_size, 0);
         
         p_put_idle(p);
     }
@@ -539,31 +543,36 @@ void co_wait(struct co *co) {
     assert(g != NULL);
     
     debug("co_wait: G%ld waiting for G%ld (%s)\n", g->coid, co->coid, co->name);
-    if (co->status == CO_DEAD) {
+    if (co_get_status(co) == CO_DEAD) {
         debug("co_wait: G%ld already dead\n", co->coid);
         return;
     }
     // main 主线程特判，现在就忙等待 TODO： 唤醒
     if (g == &main_co) {
         debug("main co_wait: main coroutine cannot wait, busy waiting\n");
-        while (co->status != CO_DEAD) {
+        while (co_get_status(co) != CO_DEAD) {
             usleep(1000); // 主线程忙等待
         }
         debug("main co_wait: main coroutine finished waiting for G%ld\n", co->coid);
         return;
     }
-    // 将当前协程加入等待列表
-    struct co_list_node *node = malloc(sizeof(struct co_list_node));
-    if (!node) {
-        panic("failed to allocate wait node\n");
-        return;
-    }
-    
-    node->co = g;
+
+    debug("co_wait: G%ld adding to waiters of G%ld (%s)\n", g->coid, co->coid, co->name);
+    // 将当前协程 g 加入 co 的等待列表
     pthread_mutex_lock(&co->waiters_lock);
-    list_add_tail(&node->node, &co->waiters);
+    if (co_get_status(co) == CO_DEAD) { // co 已经死了 直接 return
+        pthread_mutex_unlock(&co->waiters_lock);
+        return; 
+    }
+    debug("FUCKING\n");
+    assert(list_empty(&g->node)); 
+    list_move(&g->node, &co->waiters);
+    debug("FUCKING2\n");
+
+    atomic_fetch_add(&co->waitq_size, 1);
     pthread_mutex_unlock(&co->waiters_lock);
-    g->status = CO_WAITING;
+    co_set_status(g, CO_WAITING);
+
     
     if (setjmp(g->context) == 0) { // 保存上下文并让出 CPU
         co_schedule();

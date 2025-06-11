@@ -13,11 +13,6 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 
-struct co_list_node {
-    struct list_head node;
-    struct co *co;
-};
-
 enum co_status {
     CO_NEW = 1, // 新创建，还未执行过
     CO_RUNNING, // 正在运行
@@ -35,8 +30,12 @@ struct co {
     
     // 并发安全字段 - 需要原子操作或锁保护
     atomic_int status;           // 协程的状态 (使用原子操作)
+
+    // waiters 
     struct list_head waiters;    // 等待该协程的协程列表
     pthread_mutex_t waiters_lock; // 等待队列锁
+    atomic_int waitq_size;       // 等待队列大小
+    
     struct list_head node;       // 用于插入队列的节点
 
     // 协程上下文
@@ -85,10 +84,8 @@ struct P {
     
     // 本地协程队列
     struct list_head run_queue; // 本地运行队列，存放可运行的协程 G
-    struct list_head wait_queue; // 本地等待队列，存放等待的协程 G
     pthread_mutex_t queue_lock;  // 队列锁
     atomic_int runq_size;        // 运行队列大小
-    atomic_int waitq_size;       // 等待队列大小
     
     // 状态管理
     enum p_status status;        // P 的状态
