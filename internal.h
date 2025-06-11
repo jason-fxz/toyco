@@ -44,7 +44,7 @@ struct co {
     size_t         stack_size; // 栈大小
 
     // G-P-M 模型相关字段
-    struct M *m; // 协程当前所属的 M
+    // struct M *m; // 协程当前所属的 M
     struct P *p; // 协程当前所属的 P
     size_t coid; // 协程的唯一 ID (coID)
 };
@@ -70,7 +70,7 @@ struct M {
     struct list_head node;     // 用于插入各种 M 队列
 };
 
-// P 的状态
+// P 的状态 (暂且无用)
 enum p_status {
     P_IDLE = 0,     // 空闲状态
     P_RUNNING,      // 运行状态
@@ -137,7 +137,8 @@ struct scheduler {
 
 // 常量定义
 #define COMAXPROCS_DEFAULT 4          // 默认 P 数量
-#define STACK_SIZE_DEFAULT (32 * 1024) // 默认协程栈大小
-#define SCHED_STACK_SIZE (4 * 1024)   // 调度器栈大小
+#define STACK_SIZE_DEFAULT (32 * 1024) // 默认协程栈大小 32KB
+
+#define P_RUNQ_SIZE_MAX 8 // P 的最大运行队列大小，超出会向全局队列里丢
 
 #endif

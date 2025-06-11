@@ -57,38 +57,12 @@ static void co_wrapper(struct co *g) {
     // execute
     g->func(g->arg);
     
-    // dead
     debug("co_wrapper: G%ld finished\n", g->coid);
-    co_set_status(g, CO_DEAD);
-    pthread_mutex_lock(&g_sched.dead_co_lock);
-    list_add_tail(&g->node, &g_sched.dead_co_list);
-    atomic_fetch_add(&g_sched.ndead_co, 1);
-    pthread_mutex_unlock(&g_sched.dead_co_lock);
-
-    
-    // call waiters
-    struct co *entry, *tmp;
-    pthread_mutex_lock(&g->waiters_lock);
-    list_for_each_entry_safe(entry, tmp, &g->waiters, node) {
-        co_set_status(entry, CO_RUNABLE);
-        
-        assert(current_p);
-        pthread_mutex_lock(&current_p->queue_lock);
-        
-        atomic_fetch_sub(&g->waitq_size, 1);
-        list_move(&entry->node, &current_p->run_queue);
-        atomic_fetch_add(&current_p->runq_size, 1);
-
-        pthread_mutex_unlock(&current_p->queue_lock);
-    }
-    pthread_mutex_unlock(&g->waiters_lock);
-
-    co_schedule();
+    co_exit(); // dead handle (mark as dead and call waiters)
 }
 
-
 // put g into P's local run queue
-static void runq_put(struct P *p, struct co *g) {
+static void local_runq_put(struct P *p, struct co *g) {
     if (!p || !g) return;
     
     pthread_mutex_lock(&p->queue_lock);
@@ -100,7 +74,7 @@ static void runq_put(struct P *p, struct co *g) {
 }
 
 // get g from P's local run queue
-static struct co* runq_get(struct P *p) {
+static struct co* local_runq_get(struct P *p) {
     if (!p) return NULL;
 
     pthread_mutex_lock(&p->queue_lock);
@@ -149,6 +123,30 @@ static struct co* global_runq_get(void) {
     return g;
 }
 
+// 将 g 放入 runq，优先放本地队列，若本地队列不存在/已满，则放入全局队列
+static void runq_put(struct P *p, struct co *g) {
+    assert(g != NULL);
+    if (p == NULL) {
+        global_runq_put(g);
+        return;
+    }
+    if (atomic_load(&p->runq_size) < P_RUNQ_SIZE_MAX) {
+        pthread_mutex_lock(&p->queue_lock);
+        if (p->runq_size >= P_RUNQ_SIZE_MAX) {
+            pthread_mutex_unlock(&p->queue_lock);
+            global_runq_put(g);
+            return;
+        }
+        g->p = p;
+        atomic_fetch_add(&p->runq_size, 1);
+        list_add_tail(&g->node, &p->run_queue);
+        pthread_mutex_unlock(&p->queue_lock);
+    } else {
+        global_runq_put(g);
+    }
+    
+}
+
 // 从其他P窃取协程
 bool steal_work(struct P *thisp) {
     if (!thisp) return false;
@@ -183,7 +181,7 @@ struct co* find_runnable(struct P *p) {
     debug("find_runnable: searching for runnable G in P%d\n", p->id);
     
     // 1. 检查本地队列
-    struct co *g = runq_get(p);
+    struct co *g = local_runq_get(p);
     if (g) return g;
     
     // 2. 检查全局队列
@@ -192,7 +190,7 @@ struct co* find_runnable(struct P *p) {
 
     // 3. 工作窃取
     if (steal_work(p)) {
-        g = runq_get(p);
+        g = local_runq_get(p);
         if (g) return g;
     }
     return NULL;
@@ -310,15 +308,13 @@ static void* m_main_loop(void *arg) {
 }
 
 
-//===================================================================
-// 调度器核心
-//===================================================================
-
-// 协程调度
+// 协程调度 
+// 这段函数可以在任意栈上调用，只是临时借用一下栈，任何出口都不会返回
 void co_schedule(void) {
     struct M *m = current_m;
     struct P *p = current_p;
     
+    current_g = NULL; // 进入 schedule 时清除 current_g 标记
     if (!m || !p) {
         panic("g_schedule: no current M or P\n");
     }
@@ -327,7 +323,6 @@ void co_schedule(void) {
     struct co *g = find_runnable(p);
     if (g) {
         current_g = g;
-        g->m = m;
         g->p = p;
         m->cur_g = g;
 
@@ -510,11 +505,46 @@ struct co* co_start(const char *name, void (*func)(void *), void *arg) {
     }
     
     debug("co_start: created G%ld (%s)\n", g->coid, g->name);
-    
-    // 主线程作为运行时实体，直接将协程放入全局队列让工作线程处理
-    global_runq_put(g);
-    
+
+    runq_put(current_p, g);
+
     return g;
+}
+
+// 退出当前协程
+void co_exit() {
+    struct co *g = current_g;
+    assert(g != NULL);
+    if (g == &main_co) { // 特判 main 协程
+        debug("co_exit: main coroutine cannot exit\n");
+        return;
+    }    
+    // dead
+    co_set_status(g, CO_DEAD);
+    pthread_mutex_lock(&g_sched.dead_co_lock);
+    list_add_tail(&g->node, &g_sched.dead_co_list);
+    atomic_fetch_add(&g_sched.ndead_co, 1);
+    pthread_mutex_unlock(&g_sched.dead_co_lock);
+
+    // call waiters
+    struct co *entry, *tmp;
+    pthread_mutex_lock(&g->waiters_lock);
+    list_for_each_entry_safe(entry, tmp, &g->waiters, node) {
+        co_set_status(entry, CO_RUNABLE);
+        
+        assert(current_p);
+        pthread_mutex_lock(&current_p->queue_lock);
+        
+        atomic_fetch_sub(&g->waitq_size, 1);
+        list_move(&entry->node, &current_p->run_queue);
+        entry->p = current_p;
+        atomic_fetch_add(&current_p->runq_size, 1);
+
+        pthread_mutex_unlock(&current_p->queue_lock);
+    }
+    pthread_mutex_unlock(&g->waiters_lock);
+
+    co_schedule();
 }
 
 // 协程让出 CPU
@@ -564,11 +594,8 @@ void co_wait(struct co *co) {
         pthread_mutex_unlock(&co->waiters_lock);
         return; 
     }
-    debug("FUCKING\n");
     assert(list_empty(&g->node)); 
     list_move(&g->node, &co->waiters);
-    debug("FUCKING2\n");
-
     atomic_fetch_add(&co->waitq_size, 1);
     pthread_mutex_unlock(&co->waiters_lock);
     co_set_status(g, CO_WAITING);
@@ -581,6 +608,7 @@ void co_wait(struct co *co) {
     }
 }
 
+// 手动释放协程资源
 void co_free(struct co *co) {
     if (!co || co == &main_co) return; // 不释放主协程
     debug("co_free: freeing G%ld (%s)\n", co->coid, co->name);
