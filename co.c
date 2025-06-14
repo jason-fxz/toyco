@@ -1,7 +1,3 @@
-#include "list.h"
-#include "co.h"
-#include "panic.h"
-#include "internal.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +6,11 @@
 #include <stdio.h>
 #include <stdatomic.h>
 #include <setjmp.h>
+#include "list.h"
+#include "co.h"
+#include "panic.h"
+#include "internal.h"
+#include "utils.h"
 
 // this function is used to switch stack and start a function on the new stack
 //   ! this function never return
@@ -70,7 +71,7 @@ static void local_runq_put(struct P *p, struct co *g) {
     list_add_tail(&g->node, &p->run_queue);
     atomic_fetch_add(&p->runq_size, 1);
     pthread_mutex_unlock(&p->queue_lock);
-    debug("runq_put: G%ld -> P%d\n", g->coid, p->id);
+    debug("local_runq_put: P%d <- G%ld (%s)\n", p->id, g->coid, g->name);
 }
 
 // get g from P's local run queue
@@ -89,8 +90,8 @@ static struct co* local_runq_get(struct P *p) {
     pthread_mutex_unlock(&p->queue_lock);
     
     assert(g != NULL);
-    assert_msg(g->p == p, "g = %p\n", g); 
-    debug("runq_get: G%ld (%s) <- P%d\n", g->coid, g->name, p->id);
+    assert_msg(g->p == p, "g: %p G%ld (%s)\n", g, g->coid, g->name); 
+    debug("local_runq_get: G%ld (%s) <- P%d\n", g->coid, g->name, p->id);
 
     return g;
 }
@@ -101,26 +102,40 @@ static void global_runq_put(struct co *g) {
     
     pthread_mutex_lock(&g_sched.global_runq_lock);
     list_add_tail(&g->node, &g_sched.global_runq);
-    atomic_fetch_add(&g_sched.global_runq_size, 1);
+    g_sched.global_runq_size++;
+    assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_put: g_sched.global_runq_size=%d, list_size=%d\n", g_sched.global_runq_size, list_size(&g_sched.global_runq));
     pthread_mutex_unlock(&g_sched.global_runq_lock);
     debug("global_runq_put: G%ld (%s)\n", g->coid, g->name);
 }
 
-// get g from global run queue
-static struct co* global_runq_get(void) {
-    pthread_mutex_lock(&g_sched.global_runq_lock);
-    if (list_empty(&g_sched.global_runq)) {
-        pthread_mutex_unlock(&g_sched.global_runq_lock);
+// 从全局运行队列获取 max 个协程，第一个会直接返回，其余插入到 P 的本地队列 
+// max = 0 时自动计算获取个数, 
+// !! 需要在调用这个函数前对 g_sched.global_runq_lock 上锁
+static struct co* global_runq_get(struct P *p, int max) {
+    if (g_sched.global_runq_size == 0) {
         return NULL;
     }
-    
-    struct co *g = list_first_entry(&g_sched.global_runq, struct co, node);
-    list_del_init(&g->node);
-    atomic_fetch_sub(&g_sched.global_runq_size, 1);
-    pthread_mutex_unlock(&g_sched.global_runq_lock);
-
-    debug("global_runq_get: G%ld (%s)\n", g->coid, g->name);
-    return g;
+    int n = g_sched.global_runq_size / g_sched.nproc + 1; // 平均
+    if (n > g_sched.global_runq_size) n = g_sched.global_runq_size;
+    if (max > 0 && n > max) n = max; 
+    if (n > P_RUNQ_SIZE_MAX / 2) n = P_RUNQ_SIZE_MAX / 2;
+    int psize = atomic_load(&p->runq_size);
+    if (psize + n - 1 > P_RUNQ_SIZE_MAX) n = P_RUNQ_SIZE_MAX - psize + 1;
+    assert(n > 0);
+    g_sched.global_runq_size -= n;
+    assert(g_sched.global_runq_size >= 0);
+    struct co *g1 = list_pop_front(&g_sched.global_runq, struct co, node);
+    debug("global_runq_get: G%ld (%s) <- global run queue, n = %d\n", 
+          g1->coid, g1->name, n);
+    n--;
+    for (; n > 0; n--) {
+        struct co *g = list_pop_front(&g_sched.global_runq, struct co, node);
+        assert_msg(g != NULL, "n = %d g_sched.global_runq_size=%d\n", n, g_sched.global_runq_size);
+        local_runq_put(p, g);
+    }
+    assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_get: g_sched.global_runq_size=%d, list_size=%d\n", 
+               g_sched.global_runq_size, list_size(&g_sched.global_runq));
+    return g1;
 }
 
 // 将 g 放入 runq，优先放本地队列，若本地队列不存在/已满，则放入全局队列
@@ -130,69 +145,95 @@ static void runq_put(struct P *p, struct co *g) {
         global_runq_put(g);
         return;
     }
-    if (atomic_load(&p->runq_size) < P_RUNQ_SIZE_MAX) {
-        pthread_mutex_lock(&p->queue_lock);
-        if (p->runq_size >= P_RUNQ_SIZE_MAX) {
-            pthread_mutex_unlock(&p->queue_lock);
-            global_runq_put(g);
-            return;
-        }
-        g->p = p;
-        atomic_fetch_add(&p->runq_size, 1);
-        list_add_tail(&g->node, &p->run_queue);
+    pthread_mutex_lock(&p->queue_lock);
+    if (atomic_load(&p->runq_size) >= P_RUNQ_SIZE_MAX) {
         pthread_mutex_unlock(&p->queue_lock);
-    } else {
         global_runq_put(g);
+        return;
     }
-    
+    g->p = p;
+    atomic_fetch_add(&p->runq_size, 1);
+    list_add_tail(&g->node, &p->run_queue);
+    pthread_mutex_unlock(&p->queue_lock);
 }
-
 // 从其他P窃取协程
-bool steal_work(struct P *thisp) {
-    if (!thisp) return false;
+struct co* steal_work(struct P *p) {
+    if (!p) return NULL;
     
-    // for (int i = 0; i < g_sched.num_p; i++) {
-    //     struct P *p = &g_sched.all_p[i];
-    //     if (p == thisp || p->status != P_RUNNING) continue;
-        
-    //     int size = atomic_load(&p->runq_size);
-    //     if (size <= 1) continue; // 不值得窃取
-        
-    //     pthread_mutex_lock(&p->queue_lock);
-    //     if (!list_empty(&p->run_queue)) {
-    //         struct co *g = list_first_entry(&p->run_queue, struct co, node);
-    //         list_del(&g->node);
-    //         atomic_fetch_sub(&p->runq_size, 1);
-    //         pthread_mutex_unlock(&p->queue_lock);
-            
-    //         // 将窃取到的协程放入本地队列
-    //         runq_put(thisp, g);
-    //         debug("steal_work: P%d stole G%ld from P%d\n", thisp->id, g->coid, p->id);
-    //         return true;
-    //     }
-    //     pthread_mutex_unlock(&p->queue_lock);
-    // }
-    return false;
+    debug("steal_work: P%d trying to steal work\n", p->id);
+
+    for (int i = 0; i < P_STEAL_TRIES; ++i) {
+        // random enum P
+        int nproc = g_sched.nproc;
+        int perm[nproc];
+        for (int i = 0; i < nproc; ++i) perm[i] = i;
+        for (int i = nproc - 1; i > 0; --i) {
+            int j = fast_rand() % (i + 1);
+            int tmp = perm[i];
+            perm[i] = perm[j];
+            perm[j] = tmp;
+        }
+
+        for (int k = 0; k < nproc; ++k) {
+            struct P *victim = &g_sched.all_p[perm[k]];
+            if (victim == p || victim->status != P_RUNNING) continue;
+
+            pthread_mutex_lock(&victim->queue_lock);
+            int n = atomic_load(&victim->runq_size);
+            if (n <= 1) {
+                pthread_mutex_unlock(&victim->queue_lock);
+                continue;
+            }
+            n -= n / 2;
+            assert(n > 0);
+            atomic_fetch_sub(&victim->runq_size, n);
+            struct co *g1 = list_pop_back(&victim->run_queue, struct co, node);
+            assert(g1 != NULL);
+            debug("steal_work: P%d stole G%ld (%s) from P%d, n = %d\n", 
+                  p->id, g1->coid, g1->name, victim->id, n);
+            n--;
+            for (; n > 0; n--) {
+                struct co *g = list_pop_back(&victim->run_queue, struct co, node);
+                assert(g != NULL);
+                local_runq_put(p, g);
+            }
+            pthread_mutex_unlock(&victim->queue_lock);
+            return g1;
+        }
+    }  
+    return NULL;
 }
 
 // 寻找可运行的协程
 struct co* find_runnable(struct P *p) {
     assert_msg(p != NULL, "find_runnable: P is NULL\n");
     debug("find_runnable: searching for runnable G in P%d\n", p->id);
+    struct co *g = NULL;
+    
+    // 0. 一定调度次数后检查全局队列
+    if (p->sched_tick % P_SCHED_CHECK_INTERVAL == 0) {
+        pthread_mutex_lock(&g_sched.global_runq_lock);
+        g = global_runq_get(p, 1);
+        pthread_mutex_unlock(&g_sched.global_runq_lock);
+        if (g) {
+            return g;
+        }
+    }
     
     // 1. 检查本地队列
-    struct co *g = local_runq_get(p);
+    g = local_runq_get(p);
     if (g) return g;
     
-    // 2. 检查全局队列
-    g = global_runq_get();
+    // 2. 检查全局队列 (自动选择窃取数量) 
+    pthread_mutex_lock(&g_sched.global_runq_lock);
+    g = global_runq_get(p, 0);
+    pthread_mutex_unlock(&g_sched.global_runq_lock);
     if (g) return g;
 
     // 3. 工作窃取
-    if (steal_work(p)) {
-        g = local_runq_get(p);
-        if (g) return g;
-    }
+    g = steal_work(p);
+    if (g) return g;
+
     return NULL;
 }
 
@@ -318,8 +359,9 @@ void co_schedule(void) {
     if (!m || !p) {
         panic("g_schedule: no current M or P\n");
     }
-    
+
     // 寻找下一个可运行的协程
+    p->sched_tick++;    
     struct co *g = find_runnable(p);
     if (g) {
         current_g = g;
@@ -352,18 +394,18 @@ void scheduler_init(void) {
     // 设置默认参数
     char *max_procs_env = getenv("COMAXPROCS");
     if (max_procs_env) {
-        g_sched.num_p = atoi(max_procs_env);
-        if (g_sched.num_p <= 0) {
+        g_sched.nproc = atoi(max_procs_env);
+        if (g_sched.nproc <= 0) {
             panic("COMAXPROCS must be a positive integer\n");
         }
     } else {
-        g_sched.num_p = COMAXPROCS_DEFAULT; // 默认值
+        g_sched.nproc = COMAXPROCS_DEFAULT; // 默认值
     }
     
     // 初始化全局队列
     INIT_LIST_HEAD(&g_sched.global_runq);
     pthread_mutex_init(&g_sched.global_runq_lock, NULL);
-    atomic_store(&g_sched.global_runq_size, 0);
+    g_sched.global_runq_size = 0;
     
     // 初始化空闲 P 列表
     INIT_LIST_HEAD(&g_sched.idle_p_list);
@@ -385,12 +427,12 @@ void scheduler_init(void) {
     atomic_store(&g_sched.ndead_co, 0);
 
     // 创建 P 数组
-    g_sched.all_p = calloc(g_sched.num_p, sizeof(struct P));
+    g_sched.all_p = calloc(g_sched.nproc, sizeof(struct P));
     if (!g_sched.all_p) {
         panic("failed to allocate P array\n");
     }
     
-    for (int i = 0; i < g_sched.num_p; i++) {
+    for (int i = 0; i < g_sched.nproc; i++) {
         struct P *p = g_sched.all_p + i;
         p->id = i + 1;
         p->status = P_IDLE;
@@ -415,7 +457,7 @@ void scheduler_init(void) {
     
     atomic_store(&g_sched.stop_the_world, false);
     
-    debug("scheduler_init: scheduler initialized with %d P\n", g_sched.num_p);
+    debug("scheduler_init: scheduler initialized with %d P\n", g_sched.nproc);
 }
 
 // 启动调度器
@@ -423,7 +465,7 @@ void scheduler_start(void) {
     debug("scheduler_start: starting scheduler\n");
     
     // 创建初始的 M，数量等于 P 的数量
-    for (int i = 0; i < g_sched.num_p; i++) {
+    for (int i = 0; i < g_sched.nproc; i++) {
         struct M *m = m_create();
         if (!m) {
             panic("failed to create M%d\n", i);
@@ -438,7 +480,7 @@ void scheduler_start(void) {
         }
     }
     
-    debug("scheduler_start: started %d machines\n", g_sched.num_p);
+    debug("scheduler_start: started %d machines\n", g_sched.nproc);
 }
 
 // 停止调度器

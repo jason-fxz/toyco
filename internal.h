@@ -90,6 +90,9 @@ struct P {
     // 状态管理
     enum p_status status;        // P 的状态
     struct list_head idle_node;  // 用于插入空闲 P 列表  
+
+    // 调度信息
+    uint64_t sched_tick; // 调度次数计数器
 };
 
 
@@ -98,24 +101,18 @@ struct P {
 struct scheduler {
     // P 数组 (P 数量固定)
     struct P *all_p;           // 所有 P 的数组
-    int num_p;                 // P 的数量
+    int nproc;                 // P 的数量
     
     // M 队列管理 (M 数量动态变化)
     struct list_head all_m_list;      // 所有 M 的队列
-    // struct list_head idle_m_list;     // 空闲 M 队列
-    // struct list_head spinning_m_list; // 自旋 M 队列
-    // struct list_head blocked_m_list;  // 阻塞 M 队列 (执行系统调用)
     pthread_mutex_t m_lock;           // M 队列锁
     atomic_int num_m;                 // 当前 M 总数
-    // atomic_int num_idle_m;            // 空闲 M 数量
-    // atomic_int num_spinning_m;        // 自旋 M 数量
-    // atomic_int num_blocked_m;         // 阻塞 M 数量
     atomic_int m_id_gen;              // M ID 生成器
     
     // 全局协程队列
     struct list_head global_runq;     // 全局运行队列
     pthread_mutex_t global_runq_lock; // 全局队列锁
-    atomic_int global_runq_size;      // 全局运行队列大小
+    int global_runq_size;      // 全局运行队列大小
     
     // 死亡协程表
     struct list_head dead_co_list;     // 死亡协程列表
@@ -137,8 +134,12 @@ struct scheduler {
 
 // 常量定义
 #define COMAXPROCS_DEFAULT 4          // 默认 P 数量
-#define STACK_SIZE_DEFAULT (32 * 1024) // 默认协程栈大小 32KB
+#define STACK_SIZE_DEFAULT (1024 * 1024) // 默认协程栈大小 32KB
 
 #define P_RUNQ_SIZE_MAX 8 // P 的最大运行队列大小，超出会向全局队列里丢
+
+#define P_SCHED_CHECK_INTERVAL 61 // P 调度检查间隔 (每 P_SCHED_CHECK_INTERVAL 次检查是否需要调整本地队列)
+
+#define P_STEAL_TRIES 3 // 窃取工作尝试次数
 
 #endif

@@ -209,6 +209,22 @@ static inline void list_splice_init(struct list_head *list,
 	list_entry((ptr)->next, type, member)
 
 /**
+ * list_pop_front - Pop the first element from a list
+ * @head: the list head to take the element from.
+ * @type: the type of the struct this is embedded in.
+ * @member: the name of the list_head within the struct.
+ */
+#define list_pop_front(head, type, member)                         \
+    ({                                                        \
+        type *__ret = NULL;                                   \
+        if (!list_empty(head)) {                              \
+            __ret = list_first_entry(head, type, member);     \
+            list_del_init(&__ret->member);                    \
+        }                                                     \
+        __ret;                                                \
+    })
+
+/**
  * list_last_entry - get the last element from a list
  * @ptr:	the list head to take the element from.
  * @type:	the type of the struct this is embedded in.
@@ -218,6 +234,22 @@ static inline void list_splice_init(struct list_head *list,
  */
 #define list_last_entry(ptr, type, member) \
 	list_entry((ptr)->prev, type, member)
+
+/**
+ * list_pop_back - Pop the last element from a list
+ * @head: the list head to take the element from.
+ * @type: the type of the struct this is embedded in.
+ * @member: the name of the list_head within the struct.
+ */
+#define list_pop_back(head, type, member)                         \
+	({                                                        \
+		type *__ret = NULL;                                   \
+		if (!list_empty(head)) {                              \
+			__ret = list_last_entry(head, type, member);      \
+			list_del_init(&__ret->member);                    \
+		}                                                     \
+		__ret;                                                \
+	})
 
 /**
  * list_for_each	-	iterate over a list
@@ -270,5 +302,22 @@ static inline void list_splice_init(struct list_head *list,
 	     &pos->member != (head); 					\
 	     pos = n, n = list_entry(n->member.next, typeof(*n), member))
 
+/**
+ * list_size - 计算链表中节点数
+ * @head: 链表头指针（list_head）
+ *
+ * 返回链表中节点的个数
+ */
+static inline int list_size(const struct list_head *head)
+{
+    int count = 0;
+    const struct list_head *pos;
+
+    list_for_each(pos, head) {
+        count++;
+    }
+
+    return count;
+}
 
 #endif /* _LIST_H_ */
