@@ -28,15 +28,15 @@ struct co {
     void (*func)(void *); // co_start 指定的入口地址和参数
     void *arg;
     
-    // 并发安全字段 - 需要原子操作或锁保护
-    atomic_int status;           // 协程的状态 (使用原子操作)
+    pthread_mutex_t lock;        // 用于保护协程状态
+    enum co_status status;       // 协程的状态
+    struct list_head node;       // 用于插入队列的节点
 
     // waiters 
     struct list_head waiters;    // 等待该协程的协程列表
     pthread_mutex_t waiters_lock; // 等待队列锁
-    atomic_int waitq_size;       // 等待队列大小
+    int waitq_size;       // 等待队列大小
     
-    struct list_head node;       // 用于插入队列的节点
 
     // 协程上下文
     jmp_buf        context; // 寄存器现场
@@ -49,8 +49,19 @@ struct co {
     size_t coid; // 协程的唯一 ID (coID)
 };
 
-#define co_get_status(g)    atomic_load(&(g)->status)
-#define co_set_status(g, s) atomic_store(&(g)->status, (s))
+#define co_get_status(g)  \
+    ({ \
+        pthread_mutex_lock(&(g)->lock); \
+        enum co_status status = (g)->status; \
+        pthread_mutex_unlock(&(g)->lock); \
+        status; \
+    })
+
+#define co_set_status(g, s) do { \
+    pthread_mutex_lock(&(g)->lock); \
+    (g)->status = (s); \
+    pthread_mutex_unlock(&(g)->lock); \
+} while (0)
 
 // M (Machine) - 系统线程，负责执行 G
 struct M {
@@ -85,7 +96,7 @@ struct P {
     // 本地协程队列
     struct list_head run_queue; // 本地运行队列，存放可运行的协程 G
     pthread_mutex_t queue_lock;  // 队列锁
-    atomic_int runq_size;        // 运行队列大小
+    int runq_size;        // 运行队列大小
     
     // 状态管理
     enum p_status status;        // P 的状态
@@ -117,7 +128,7 @@ struct scheduler {
     // 死亡协程表
     struct list_head dead_co_list;     // 死亡协程列表
     pthread_mutex_t dead_co_lock;      // 死亡协程列表锁
-    atomic_int ndead_co;                // 死亡协程数量
+    int ndead_co;                // 死亡协程数量
 
     // 空闲 P 列表
     struct list_head idle_p_list;      // 空闲 P 列表
@@ -136,7 +147,7 @@ struct scheduler {
 #define COMAXPROCS_DEFAULT 4          // 默认 P 数量
 #define STACK_SIZE_DEFAULT (1024 * 1024) // 默认协程栈大小 32KB
 
-#define P_RUNQ_SIZE_MAX 8 // P 的最大运行队列大小，超出会向全局队列里丢
+#define P_RUNQ_SIZE_MAX 4 // P 的最大运行队列大小，超出会向全局队列里丢
 
 #define P_SCHED_CHECK_INTERVAL 61 // P 调度检查间隔 (每 P_SCHED_CHECK_INTERVAL 次检查是否需要调整本地队列)
 

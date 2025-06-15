@@ -40,6 +40,7 @@ static struct scheduler g_sched = {0};
 __thread struct M *current_m = NULL;
 __thread struct P *current_p = NULL; 
 __thread struct co *current_g = NULL;
+__thread int is_main_thread = 0; // 是否是主线程
 
 static struct co main_co;
 
@@ -69,7 +70,7 @@ static void local_runq_put(struct P *p, struct co *g) {
     pthread_mutex_lock(&p->queue_lock);
     g->p = p;
     list_add_tail(&g->node, &p->run_queue);
-    atomic_fetch_add(&p->runq_size, 1);
+    p->runq_size++;
     pthread_mutex_unlock(&p->queue_lock);
     debug("local_runq_put: P%d <- G%ld (%s)\n", p->id, g->coid, g->name);
 }
@@ -79,19 +80,19 @@ static struct co* local_runq_get(struct P *p) {
     if (!p) return NULL;
 
     pthread_mutex_lock(&p->queue_lock);
+    assert(p->runq_size == list_size(&p->run_queue));
     if (list_empty(&p->run_queue)) {
         pthread_mutex_unlock(&p->queue_lock);
         return NULL;
     }
-    
-    struct co *g = list_first_entry(&p->run_queue, struct co, node);
-    list_del_init(&g->node);
-    atomic_fetch_sub(&p->runq_size, 1);
+
+    struct co *g = list_pop_front(&p->run_queue, struct co, node);
+    p->runq_size--;
     pthread_mutex_unlock(&p->queue_lock);
     
     assert(g != NULL);
     assert_msg(g->p == p, "g: %p G%ld (%s)\n", g, g->coid, g->name); 
-    debug("local_runq_get: G%ld (%s) <- P%d\n", g->coid, g->name, p->id);
+    debug("local_runq_get: G%ld (%s) <- P%d (len=%d)\n", g->coid, g->name, p->id, p->runq_size);
 
     return g;
 }
@@ -99,10 +100,18 @@ static struct co* local_runq_get(struct P *p) {
 // put g into global run queue
 static void global_runq_put(struct co *g) {
     if (!g) return;
-    
+    g->p = NULL;
     pthread_mutex_lock(&g_sched.global_runq_lock);
+    assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_get: g_sched.global_runq_size=%d, list_size=%d\n", 
+               g_sched.global_runq_size, list_size(&g_sched.global_runq));
+    if (g_sched.global_runq_size == 0) {
+        assert(g_sched.global_runq.next == &g_sched.global_runq);
+        assert(g_sched.global_runq.prev == &g_sched.global_runq);
+    }
+               
     list_add_tail(&g->node, &g_sched.global_runq);
     g_sched.global_runq_size++;
+
     assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_put: g_sched.global_runq_size=%d, list_size=%d\n", g_sched.global_runq_size, list_size(&g_sched.global_runq));
     pthread_mutex_unlock(&g_sched.global_runq_lock);
     debug("global_runq_put: G%ld (%s)\n", g->coid, g->name);
@@ -112,27 +121,49 @@ static void global_runq_put(struct co *g) {
 // max = 0 时自动计算获取个数, 
 // !! 需要在调用这个函数前对 g_sched.global_runq_lock 上锁
 static struct co* global_runq_get(struct P *p, int max) {
+    assert(p == current_p);
+    assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_get: g_sched.global_runq_size=%d, list_size=%d\n", 
+               g_sched.global_runq_size, list_size(&g_sched.global_runq));
     if (g_sched.global_runq_size == 0) {
         return NULL;
     }
     int n = g_sched.global_runq_size / g_sched.nproc + 1; // 平均
     if (n > g_sched.global_runq_size) n = g_sched.global_runq_size;
+
     if (max > 0 && n > max) n = max; 
     if (n > P_RUNQ_SIZE_MAX / 2) n = P_RUNQ_SIZE_MAX / 2;
-    int psize = atomic_load(&p->runq_size);
-    if (psize + n - 1 > P_RUNQ_SIZE_MAX) n = P_RUNQ_SIZE_MAX - psize + 1;
     assert(n > 0);
+
+    if (p->runq_size == P_RUNQ_SIZE_MAX) {
+        assert(n == 1);
+        // fprintf(stderr, "FUCK\n");
+    }
+    if (max != 0) {
+        assert_msg(n == max, "global_runq_get: n = %d, max = %d\n", n, max);
+    }
     g_sched.global_runq_size -= n;
     assert(g_sched.global_runq_size >= 0);
+    
     struct co *g1 = list_pop_front(&g_sched.global_runq, struct co, node);
+    assert(g1 != NULL);
     debug("global_runq_get: G%ld (%s) <- global run queue, n = %d\n", 
           g1->coid, g1->name, n);
     n--;
+    
     for (; n > 0; n--) {
         struct co *g = list_pop_front(&g_sched.global_runq, struct co, node);
         assert_msg(g != NULL, "n = %d g_sched.global_runq_size=%d\n", n, g_sched.global_runq_size);
-        local_runq_put(p, g);
+        list_add_tail(&g->node, &p->run_queue);
+        p->runq_size++;
+        g->p = p;
+        // local_runq_put(p, g);
     }
+
+    if (g_sched.global_runq_size == 0) {
+        assert(g_sched.global_runq.next == &g_sched.global_runq);
+        assert(g_sched.global_runq.prev == &g_sched.global_runq);
+    }
+    
     assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_get: g_sched.global_runq_size=%d, list_size=%d\n", 
                g_sched.global_runq_size, list_size(&g_sched.global_runq));
     return g1;
@@ -146,13 +177,15 @@ static void runq_put(struct P *p, struct co *g) {
         return;
     }
     pthread_mutex_lock(&p->queue_lock);
-    if (atomic_load(&p->runq_size) >= P_RUNQ_SIZE_MAX) {
+    if (p->runq_size >= P_RUNQ_SIZE_MAX) {
         pthread_mutex_unlock(&p->queue_lock);
+        // fprintf(stderr, "runq_put: P%d run queue is full, putting G%ld (%s) into global run queue\n", 
+            //    p->id, g->coid, g->name);
         global_runq_put(g);
         return;
     }
     g->p = p;
-    atomic_fetch_add(&p->runq_size, 1);
+    p->runq_size++;
     list_add_tail(&g->node, &p->run_queue);
     pthread_mutex_unlock(&p->queue_lock);
 }
@@ -179,14 +212,14 @@ struct co* steal_work(struct P *p) {
             if (victim == p || victim->status != P_RUNNING) continue;
 
             pthread_mutex_lock(&victim->queue_lock);
-            int n = atomic_load(&victim->runq_size);
+            int n = victim->runq_size;
             if (n <= 1) {
                 pthread_mutex_unlock(&victim->queue_lock);
                 continue;
             }
             n -= n / 2;
             assert(n > 0);
-            atomic_fetch_sub(&victim->runq_size, n);
+            victim->runq_size -= n;
             struct co *g1 = list_pop_back(&victim->run_queue, struct co, node);
             assert(g1 != NULL);
             debug("steal_work: P%d stole G%ld (%s) from P%d, n = %d\n", 
@@ -211,13 +244,20 @@ struct co* find_runnable(struct P *p) {
     struct co *g = NULL;
     
     // 0. 一定调度次数后检查全局队列
-    if (p->sched_tick % P_SCHED_CHECK_INTERVAL == 0) {
+    pthread_mutex_lock(&p->queue_lock);
+    if (p->sched_tick % P_SCHED_CHECK_INTERVAL == 0 && p->runq_size <= P_RUNQ_SIZE_MAX) {
+        
+        assert(p->runq_size == list_size(&p->run_queue));
+        assert(p->runq_size <= P_RUNQ_SIZE_MAX);
         pthread_mutex_lock(&g_sched.global_runq_lock);
         g = global_runq_get(p, 1);
         pthread_mutex_unlock(&g_sched.global_runq_lock);
+        pthread_mutex_unlock(&p->queue_lock);
         if (g) {
             return g;
         }
+    } else {
+        pthread_mutex_unlock(&p->queue_lock);
     }
     
     // 1. 检查本地队列
@@ -231,8 +271,8 @@ struct co* find_runnable(struct P *p) {
     if (g) return g;
 
     // 3. 工作窃取
-    g = steal_work(p);
-    if (g) return g;
+    // g = steal_work(p);
+    // if (g) return g;
 
     return NULL;
 }
@@ -324,7 +364,8 @@ static void* m_main_loop(void *arg) {
     p->m = m;
     current_p = p;
     debug("m_main_loop: M%d bound to P%d\n", m->id, p->id);
-    
+    assert(p->m == m);
+    assert(m->p == p);
     // M main loop
     while (!atomic_load(&g_sched.stop_the_world)) {
         int val = setjmp(m->sched_context);
@@ -424,7 +465,7 @@ void scheduler_init(void) {
     // 初始化死亡协程列表
     INIT_LIST_HEAD(&g_sched.dead_co_list);
     pthread_mutex_init(&g_sched.dead_co_lock, NULL);
-    atomic_store(&g_sched.ndead_co, 0);
+    g_sched.ndead_co = 0;
 
     // 创建 P 数组
     g_sched.all_p = calloc(g_sched.nproc, sizeof(struct P));
@@ -439,8 +480,8 @@ void scheduler_init(void) {
 
         INIT_LIST_HEAD(&p->run_queue);
         pthread_mutex_init(&p->queue_lock, NULL);
-        atomic_store(&p->runq_size, 0);
-        
+        p->runq_size = 0;
+
         p_put_idle(p);
     }
     
@@ -452,12 +493,15 @@ void scheduler_init(void) {
     INIT_LIST_HEAD(&main_co.waiters);
     INIT_LIST_HEAD(&main_co.node);
     pthread_mutex_init(&main_co.waiters_lock, NULL);
+    main_co.waitq_size = 0;
     
     current_g = &main_co;
     
     atomic_store(&g_sched.stop_the_world, false);
     
     debug("scheduler_init: scheduler initialized with %d P\n", g_sched.nproc);
+
+    is_main_thread = 1;
 }
 
 // 启动调度器
@@ -535,6 +579,8 @@ struct co* co_start(const char *name, void (*func)(void *), void *arg) {
     INIT_LIST_HEAD(&g->waiters);
     INIT_LIST_HEAD(&g->node);
     pthread_mutex_init(&g->waiters_lock, NULL);
+    g->waitq_size = 0;
+    g->p = NULL; // 初始时没有绑定到 P
     
     // 分配栈
     g->stack_size = STACK_SIZE_DEFAULT;
@@ -564,8 +610,9 @@ void co_exit() {
     // dead
     co_set_status(g, CO_DEAD);
     pthread_mutex_lock(&g_sched.dead_co_lock);
+    assert(list_empty(&g->node));
     list_add_tail(&g->node, &g_sched.dead_co_list);
-    atomic_fetch_add(&g_sched.ndead_co, 1);
+    g_sched.ndead_co++;
     pthread_mutex_unlock(&g_sched.dead_co_lock);
 
     // call waiters
@@ -575,14 +622,9 @@ void co_exit() {
         co_set_status(entry, CO_RUNABLE);
         
         assert(current_p);
-        pthread_mutex_lock(&current_p->queue_lock);
-        
-        atomic_fetch_sub(&g->waitq_size, 1);
-        list_move(&entry->node, &current_p->run_queue);
-        entry->p = current_p;
-        atomic_fetch_add(&current_p->runq_size, 1);
-
-        pthread_mutex_unlock(&current_p->queue_lock);
+        list_del_init(&entry->node);
+        g->waitq_size--;
+        runq_put(current_p, entry); // 将等待的协程放回运行队列
     }
     pthread_mutex_unlock(&g->waiters_lock);
 
@@ -598,13 +640,13 @@ void co_yield(void) {
         return;
     }
     assert(current_p != NULL);
-    debug("co_yield: G%ld (%s) yielding\n", g->coid, g->name);
-    g->status = CO_RUNABLE;
+    // debug("co_yield: G%ld (%s) yielding\n", g->coid, g->name);
+    co_set_status(g, CO_RUNABLE);
     if (setjmp(g->context) == 0) { // 保存当前上下文
         runq_put(current_p, g);
         co_schedule();
     } else { // 恢复执行
-        debug("co_yield: G%ld (%s) resumed\n", g->coid, g->name);
+        // debug("co_yield: G%ld (%s) resumed\n", g->coid, g->name);
     }
 }
 
@@ -638,7 +680,7 @@ void co_wait(struct co *co) {
     }
     assert(list_empty(&g->node)); 
     list_move(&g->node, &co->waiters);
-    atomic_fetch_add(&co->waitq_size, 1);
+    co->waitq_size++;
     pthread_mutex_unlock(&co->waiters_lock);
     co_set_status(g, CO_WAITING);
 
@@ -665,7 +707,7 @@ void co_free(struct co *co) {
     // 从 g_sched.dead_co_list 中删除
     pthread_mutex_lock(&g_sched.dead_co_lock);
     list_del(&co->node);
-    atomic_fetch_sub(&g_sched.ndead_co, 1);
+    g_sched.ndead_co--;
     pthread_mutex_unlock(&g_sched.dead_co_lock);
     free(co);
 }
@@ -680,6 +722,8 @@ static void co_init(void) {
 
 __attribute__((destructor))
 static void co_cleanup(void) {
-    debug("co_cleanup: cleaning up coroutine library\n");
-    scheduler_stop();
+    if (is_main_thread) {
+        debug("co_cleanup: cleaning up coroutine library\n");
+        scheduler_stop();
+    } 
 }
