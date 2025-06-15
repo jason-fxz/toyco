@@ -28,6 +28,9 @@ struct co {
     void (*func)(void *); // co_start 指定的入口地址和参数
     void *arg;
     
+    // 协程上下文
+    jmp_buf        context; // 寄存器现场
+    
     pthread_mutex_t lock;        // 用于保护协程状态
     enum co_status status;       // 协程的状态
     struct list_head node;       // 用于插入队列的节点
@@ -38,8 +41,7 @@ struct co {
     int waitq_size;       // 等待队列大小
     
 
-    // 协程上下文
-    jmp_buf        context; // 寄存器现场
+
     uint8_t        *stack;  // 协程的栈
     size_t         stack_size; // 栈大小
 
@@ -51,16 +53,16 @@ struct co {
 
 #define co_get_status(g)  \
     ({ \
-        pthread_mutex_lock(&(g)->lock); \
+        pthread_mutex_lock(&((g)->lock)); \
         enum co_status status = (g)->status; \
-        pthread_mutex_unlock(&(g)->lock); \
+        pthread_mutex_unlock(&((g)->lock)); \
         status; \
     })
 
 #define co_set_status(g, s) do { \
-    pthread_mutex_lock(&(g)->lock); \
+    pthread_mutex_lock(&((g)->lock)); \
     (g)->status = (s); \
-    pthread_mutex_unlock(&(g)->lock); \
+    pthread_mutex_unlock(&((g)->lock)); \
 } while (0)
 
 // M (Machine) - 系统线程，负责执行 G
@@ -72,11 +74,7 @@ struct M {
     
     // 调度相关
     jmp_buf sched_context;     // 调度器上下文
-    
-    // 状态标志
-    atomic_bool spinning;      // 是否在自旋等待工作
-    atomic_bool blocked;       // 是否在系统调用中阻塞
-    
+        
     // 链表节点
     struct list_head node;     // 用于插入各种 M 队列
 };
@@ -152,5 +150,9 @@ struct scheduler {
 #define P_SCHED_CHECK_INTERVAL 61 // P 调度检查间隔 (每 P_SCHED_CHECK_INTERVAL 次检查是否需要调整本地队列)
 
 #define P_STEAL_TRIES 3 // 窃取工作尝试次数
+
+
+#define STACK_CANARY 0xDEADBEEFCAFEBABE
+
 
 #endif

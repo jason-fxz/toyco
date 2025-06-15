@@ -35,6 +35,7 @@ stack_switch_call(void *sp, void *entry, uintptr_t arg) {
     );
 }
 
+
 static struct scheduler g_sched = {0};
 
 __thread struct M *current_m = NULL;
@@ -44,6 +45,16 @@ __thread int is_main_thread = 0; // 是否是主线程
 
 static struct co main_co;
 
+static inline void __stack_check_canary(struct co *g) {
+    assert(g != NULL);
+    assert(g == &main_co || g->stack != NULL);
+    // 检查栈底 canary
+    uint64_t bottom_canary = *(uint64_t*)g->stack;
+    if (bottom_canary != STACK_CANARY) {
+        panic("stack_check_canary: G%ld (%s) stack bottom corruption detected! canary=0x%lx\n", 
+              g->coid, g->name, bottom_canary);
+    }
+}
 static void co_wrapper(struct co *g);
 void co_schedule(void);
 
@@ -53,13 +64,15 @@ static size_t next_coid(void) {
 
 // wrapper to handle coroutine execution
 static void co_wrapper(struct co *g) {
+    __stack_check_canary(g);
+    
     debug("co_wrapper: starting G%ld (%s)\n", g->coid, g->name);
-    co_set_status(g, CO_RUNNING);
     
     // execute
     g->func(g->arg);
     
     debug("co_wrapper: G%ld finished\n", g->coid);
+    __stack_check_canary(g);
     co_exit(); // dead handle (mark as dead and call waiters)
 }
 
@@ -88,6 +101,7 @@ static struct co* local_runq_get(struct P *p) {
 
     struct co *g = list_pop_front(&p->run_queue, struct co, node);
     p->runq_size--;
+    assert(g->p == p);
     pthread_mutex_unlock(&p->queue_lock);
     
     assert(g != NULL);
@@ -113,8 +127,8 @@ static void global_runq_put(struct co *g) {
     g_sched.global_runq_size++;
 
     assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_put: g_sched.global_runq_size=%d, list_size=%d\n", g_sched.global_runq_size, list_size(&g_sched.global_runq));
-    pthread_mutex_unlock(&g_sched.global_runq_lock);
     debug("global_runq_put: G%ld (%s)\n", g->coid, g->name);
+    pthread_mutex_unlock(&g_sched.global_runq_lock);
 }
 
 // 从全局运行队列获取 max 个协程，第一个会直接返回，其余插入到 P 的本地队列 
@@ -146,17 +160,22 @@ static struct co* global_runq_get(struct P *p, int max) {
     
     struct co *g1 = list_pop_front(&g_sched.global_runq, struct co, node);
     assert(g1 != NULL);
+    assert(g1->p == NULL);
     debug("global_runq_get: G%ld (%s) <- global run queue, n = %d\n", 
           g1->coid, g1->name, n);
     n--;
     
-    for (; n > 0; n--) {
-        struct co *g = list_pop_front(&g_sched.global_runq, struct co, node);
-        assert_msg(g != NULL, "n = %d g_sched.global_runq_size=%d\n", n, g_sched.global_runq_size);
-        list_add_tail(&g->node, &p->run_queue);
-        p->runq_size++;
-        g->p = p;
-        // local_runq_put(p, g);
+    if (n > 0) {
+        pthread_mutex_lock(&p->queue_lock);
+        for (; n > 0; n--) {
+            struct co *g = list_pop_front(&g_sched.global_runq, struct co, node);
+            assert_msg(g != NULL, "n = %d g_sched.global_runq_size=%d\n", n, g_sched.global_runq_size);
+            assert(g->p == NULL);
+            list_add_tail(&g->node, &p->run_queue);
+            p->runq_size++;
+            g->p = p;
+        }
+        pthread_mutex_unlock(&p->queue_lock);
     }
 
     if (g_sched.global_runq_size == 0) {
@@ -179,14 +198,13 @@ static void runq_put(struct P *p, struct co *g) {
     pthread_mutex_lock(&p->queue_lock);
     if (p->runq_size >= P_RUNQ_SIZE_MAX) {
         pthread_mutex_unlock(&p->queue_lock);
-        // fprintf(stderr, "runq_put: P%d run queue is full, putting G%ld (%s) into global run queue\n", 
-            //    p->id, g->coid, g->name);
         global_runq_put(g);
         return;
     }
     g->p = p;
     p->runq_size++;
     list_add_tail(&g->node, &p->run_queue);
+    debug("runq_put: P%d <- G%ld (%s) (len=%d)\n", p->id, g->coid, g->name, p->runq_size);
     pthread_mutex_unlock(&p->queue_lock);
 }
 // 从其他P窃取协程
@@ -240,30 +258,34 @@ struct co* steal_work(struct P *p) {
 // 寻找可运行的协程
 struct co* find_runnable(struct P *p) {
     assert_msg(p != NULL, "find_runnable: P is NULL\n");
-    debug("find_runnable: searching for runnable G in P%d\n", p->id);
+    debug("find_runnable: searching for runnable G in P%d (tick = %ld)\n", p->id, p->sched_tick);
     struct co *g = NULL;
+    assert(p == current_p);
     
     // 0. 一定调度次数后检查全局队列
-    pthread_mutex_lock(&p->queue_lock);
-    if (p->sched_tick % P_SCHED_CHECK_INTERVAL == 0 && p->runq_size <= P_RUNQ_SIZE_MAX) {
-        
-        assert(p->runq_size == list_size(&p->run_queue));
-        assert(p->runq_size <= P_RUNQ_SIZE_MAX);
-        pthread_mutex_lock(&g_sched.global_runq_lock);
-        g = global_runq_get(p, 1);
-        pthread_mutex_unlock(&g_sched.global_runq_lock);
+    if (p->sched_tick % P_SCHED_CHECK_INTERVAL == 0) {
+        bool flag = false;
+        pthread_mutex_lock(&p->queue_lock);
+        flag = (p->runq_size <= P_RUNQ_SIZE_MAX);
         pthread_mutex_unlock(&p->queue_lock);
-        if (g) {
-            return g;
-        }
-    } else {
-        pthread_mutex_unlock(&p->queue_lock);
-    }
+        if (flag) {
+            debug("find_runnable: P%d checking global run queue\n", p->id);
+            assert(p->runq_size == list_size(&p->run_queue));
+            assert(p->runq_size <= P_RUNQ_SIZE_MAX);
     
+            pthread_mutex_lock(&g_sched.global_runq_lock);
+            g = global_runq_get(p, 1);
+            pthread_mutex_unlock(&g_sched.global_runq_lock);
+            if (g) {
+                return g;
+            }
+        }
+    }
+    debug("check local_runq\n");
     // 1. 检查本地队列
     g = local_runq_get(p);
     if (g) return g;
-    
+    debug("check global_runq\n");
     // 2. 检查全局队列 (自动选择窃取数量) 
     pthread_mutex_lock(&g_sched.global_runq_lock);
     g = global_runq_get(p, 0);
@@ -321,9 +343,6 @@ static struct M* m_create(void) {
     if (!m) return NULL;
     
     m->id = next_m_id();
-
-    atomic_store(&m->spinning, false);
-    atomic_store(&m->blocked, false);
     INIT_LIST_HEAD(&m->node);
     
     debug("m_create: M%d created\n", m->id);
@@ -395,7 +414,6 @@ static void* m_main_loop(void *arg) {
 void co_schedule(void) {
     struct M *m = current_m;
     struct P *p = current_p;
-    
     current_g = NULL; // 进入 schedule 时清除 current_g 标记
     if (!m || !p) {
         panic("g_schedule: no current M or P\n");
@@ -410,6 +428,8 @@ void co_schedule(void) {
         m->cur_g = g;
 
         debug("M%d g_schedule: switching to G%ld (%s)\n", m->id, g->coid, g->name);
+
+        __stack_check_canary(g);
 
         if (co_get_status(g) == CO_NEW) {
             co_set_status(g, CO_RUNNING);
@@ -584,7 +604,8 @@ struct co* co_start(const char *name, void (*func)(void *), void *arg) {
     
     // 分配栈
     g->stack_size = STACK_SIZE_DEFAULT;
-    g->stack = malloc(g->stack_size);
+    size_t alloc_size = g->stack_size;
+    g->stack = malloc(alloc_size);
     if (!g->stack) {
         free(g->name);
         free(g);
@@ -592,6 +613,9 @@ struct co* co_start(const char *name, void (*func)(void *), void *arg) {
         return NULL;
     }
     
+    // // 在栈底部添加 canary 值用于检测栈溢出
+    *(uint64_t*)g->stack = 0xDEADBEEFCAFEBABE;
+
     debug("co_start: created G%ld (%s)\n", g->coid, g->name);
 
     runq_put(current_p, g);
@@ -601,6 +625,7 @@ struct co* co_start(const char *name, void (*func)(void *), void *arg) {
 
 // 退出当前协程
 void co_exit() {
+    __stack_check_canary(current_g);
     struct co *g = current_g;
     assert(g != NULL);
     if (g == &main_co) { // 特判 main 协程
@@ -619,26 +644,30 @@ void co_exit() {
     struct co *entry, *tmp;
     pthread_mutex_lock(&g->waiters_lock);
     list_for_each_entry_safe(entry, tmp, &g->waiters, node) {
+        list_del_init(&entry->node);
+        g->waitq_size--;
         co_set_status(entry, CO_RUNABLE);
         
         assert(current_p);
-        list_del_init(&entry->node);
-        g->waitq_size--;
         runq_put(current_p, entry); // 将等待的协程放回运行队列
     }
     pthread_mutex_unlock(&g->waiters_lock);
-
+    __stack_check_canary(current_g);
     co_schedule();
 }
 
 // 协程让出 CPU
 void co_yield(void) {
+    __stack_check_canary(current_g);
+    
     struct co *g = current_g;
     assert(g != NULL);
     if (g == &main_co) { // 特判 main
         debug("WARN co_yield: main coroutine cannot yield\n");
         return;
     }
+
+
     assert(current_p != NULL);
     // debug("co_yield: G%ld (%s) yielding\n", g->coid, g->name);
     co_set_status(g, CO_RUNABLE);
@@ -646,6 +675,7 @@ void co_yield(void) {
         runq_put(current_p, g);
         co_schedule();
     } else { // 恢复执行
+        __stack_check_canary(current_g);
         // debug("co_yield: G%ld (%s) resumed\n", g->coid, g->name);
     }
 }
@@ -656,6 +686,10 @@ void co_wait(struct co *co) {
     struct co *g = current_g; 
     assert(g != NULL);
     
+    if (g != &main_co) {
+        __stack_check_canary(current_g);
+    }
+
     debug("co_wait: G%ld waiting for G%ld (%s)\n", g->coid, co->coid, co->name);
     if (co_get_status(co) == CO_DEAD) {
         debug("co_wait: G%ld already dead\n", co->coid);
@@ -688,7 +722,8 @@ void co_wait(struct co *co) {
     if (setjmp(g->context) == 0) { // 保存上下文并让出 CPU
         co_schedule();
     } else { // 被唤醒，继续执行
-        debug("co_wait: G%ld resumed after waiting\n", g->coid);
+        __stack_check_canary(g);
+        // debug("co_wait: G%ld resumed after waiting\n", g->coid);
     }
 }
 
