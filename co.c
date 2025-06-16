@@ -43,6 +43,8 @@ __thread struct P *current_p = NULL;
 __thread struct co *current_g = NULL;
 __thread int is_main_thread = 0; // 是否是主线程
 
+__thread struct co *__co_wait_co = NULL; // 用于 co_wait 对象的临时传递
+
 static struct co main_co;
 
 static inline void __stack_check_canary(struct co *g) {
@@ -269,7 +271,7 @@ struct co* find_runnable(struct P *p) {
     if (p->sched_tick % P_SCHED_CHECK_INTERVAL == 0) {
         bool flag = false;
         pthread_mutex_lock(&p->queue_lock);
-        flag = (p->runq_size < P_RUNQ_SIZE_MAX);
+        flag = (p->runq_size <= P_RUNQ_SIZE_MAX);
         pthread_mutex_unlock(&p->queue_lock);
         if (flag) {
             debug("find_runnable: P%d checking global run queue\n", p->id);
@@ -393,11 +395,26 @@ static void* m_main_loop(void *arg) {
         int val = setjmp(m->sched_context);
         if (val == 0) { // 保存上下文，进调度
             co_schedule();
+        } else if (val == CO_SCHED_YIELD) { // co_yield
+            runq_put(current_p, current_g);
+        } else if (val == CO_SCHED_WAIT) { // co_wait
+            // 将当前协程 g 加入 co 的等待列表
+            assert(__co_wait_co != NULL);
+            pthread_mutex_lock(&__co_wait_co->waiters_lock);
+            if (co_get_status(__co_wait_co) == CO_DEAD) { // 已经死了, 回去
+                pthread_mutex_unlock(&__co_wait_co->waiters_lock);
+                longjmp(current_g->context, 1); // 恢复到 co 的上下文
+            }
+            assert(list_empty(&current_g->node)); 
+            list_move(&current_g->node, &__co_wait_co->waiters);
+            __co_wait_co->waitq_size++;
+            co_set_status(current_g, CO_WAITING);
+            pthread_mutex_unlock(&__co_wait_co->waiters_lock);
+            __co_wait_co = NULL; // 清空等待协程
+        } else if (val == CO_SCHED_EXIT) { // co_exit
+            // nothing to do
         } else {
-            // 恢复到主循环上下文: 因为没有协程可以运行
-            // TODO 睡眠队列
-            // 当前 spin
-            usleep(10000); // 10ms
+            panic("m_main_loop: unexpected jump value %d\n", val);
         }
     }
     
@@ -413,7 +430,7 @@ static void* m_main_loop(void *arg) {
 
 
 // 协程调度 
-// 这段函数可以在任意栈上调用，只是临时借用一下栈，任何出口都不会返回
+// !!只允许在 m_main_loop 中调用
 void co_schedule(void) {
     struct M *m = current_m;
     struct P *p = current_p;
@@ -443,10 +460,9 @@ void co_schedule(void) {
         } else {
             panic("g_schedule: G%ld (%s) is not in a runnable state\n", g->coid, g->name);
         }
-    } else { // 没有可运行的协程，返回到 M 的主循环
-        debug("M%d g_schedule: no runnable G found\n", m->id);
-        longjmp(m->sched_context, 1);
-    }
+    } 
+    // 没有可运行的协程，返回到 M 的主循环
+    debug("M%d g_schedule: no runnable G found\n", m->id);
 }
 
 // 初始化调度器
@@ -656,7 +672,7 @@ void co_exit() {
     }
     pthread_mutex_unlock(&g->waiters_lock);
     __stack_check_canary(current_g);
-    co_schedule();
+    longjmp(current_m->sched_context, CO_SCHED_EXIT); // 返回到 M 的调度器
 }
 
 // 协程让出 CPU
@@ -675,8 +691,7 @@ void co_yield(void) {
     // debug("co_yield: G%ld (%s) yielding\n", g->coid, g->name);
     co_set_status(g, CO_RUNABLE);
     if (setjmp(g->context) == 0) { // 保存当前上下文
-        runq_put(current_p, g);
-        co_schedule();
+        longjmp(current_m->sched_context, CO_SCHED_YIELD); // 到 M 调度器
     } else { // 恢复执行
         __stack_check_canary(current_g);
         // debug("co_yield: G%ld (%s) resumed\n", g->coid, g->name);
@@ -707,23 +722,11 @@ void co_wait(struct co *co) {
         debug("main co_wait: main coroutine finished waiting for G%ld\n", co->coid);
         return;
     }
-
-    debug("co_wait: G%ld adding to waiters of G%ld (%s)\n", g->coid, co->coid, co->name);
-    // 将当前协程 g 加入 co 的等待列表
-    pthread_mutex_lock(&co->waiters_lock);
-    if (co_get_status(co) == CO_DEAD) { // co 已经死了 直接 return
-        pthread_mutex_unlock(&co->waiters_lock);
-        return; 
-    }
-    assert(list_empty(&g->node)); 
-    list_move(&g->node, &co->waiters);
-    co->waitq_size++;
-    co_set_status(g, CO_WAITING);
-    pthread_mutex_unlock(&co->waiters_lock);
-
     
     if (setjmp(g->context) == 0) { // 保存上下文并让出 CPU
-        co_schedule();
+        __co_wait_co = co;
+        assert(__co_wait_co != NULL);
+        longjmp(current_m->sched_context, CO_SCHED_WAIT); // 到 M 调度器
     } else { // 被唤醒，继续执行
         __stack_check_canary(g);
         // debug("co_wait: G%ld resumed after waiting\n", g->coid);

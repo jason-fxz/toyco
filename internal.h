@@ -22,6 +22,12 @@ enum co_status {
     CO_SYSCALL  // TODO 阻塞在系统调用，此时分配了一个 M
 };
 
+enum co_sched_type {
+    CO_SCHED_YIELD = 1, // 协程让出 CPU
+    CO_SCHED_WAIT,      // 协程等待其他协程结束
+    CO_SCHED_EXIT,     // 协程退出
+};
+
 // 协程结构体 co (G)
 struct co {
     char *name;
@@ -40,7 +46,6 @@ struct co {
     pthread_mutex_t waiters_lock; // 等待队列锁
     int waitq_size;       // 等待队列大小
     
-
 
     uint8_t        *stack;  // 协程的栈
     size_t         stack_size; // 栈大小

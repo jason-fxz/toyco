@@ -9,7 +9,7 @@
 
 #define panic(fmt, ...) do { \
     fprintf(stderr, "\033[31mPANIC\033[0m at %s:%d in %s: " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
-    exit(1); \
+    abort(); \
 } while (0)
 
 #define assert(cond) do { \
