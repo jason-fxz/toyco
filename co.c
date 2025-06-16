@@ -47,7 +47,8 @@ static struct co main_co;
 
 static inline void __stack_check_canary(struct co *g) {
     assert(g != NULL);
-    assert(g == &main_co || g->stack != NULL);
+    if (g == &main_co) return; // 主协程不检查栈
+    assert(g->stack != NULL);
     // 检查栈底 canary
     uint64_t bottom_canary = *(uint64_t*)g->stack;
     if (bottom_canary != STACK_CANARY) {
@@ -113,7 +114,8 @@ static struct co* local_runq_get(struct P *p) {
 
 // put g into global run queue
 static void global_runq_put(struct co *g) {
-    if (!g) return;
+    assert(g != NULL);
+    // assert(g->status == CO_RUNABLE || g->status == CO_NEW);
     g->p = NULL;
     pthread_mutex_lock(&g_sched.global_runq_lock);
     assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_get: g_sched.global_runq_size=%d, list_size=%d\n", 
@@ -191,6 +193,7 @@ static struct co* global_runq_get(struct P *p, int max) {
 // 将 g 放入 runq，优先放本地队列，若本地队列不存在/已满，则放入全局队列
 static void runq_put(struct P *p, struct co *g) {
     assert(g != NULL);
+    // assert(g->status == CO_RUNABLE || g->status == CO_NEW);
     if (p == NULL) {
         global_runq_put(g);
         return;
@@ -266,7 +269,7 @@ struct co* find_runnable(struct P *p) {
     if (p->sched_tick % P_SCHED_CHECK_INTERVAL == 0) {
         bool flag = false;
         pthread_mutex_lock(&p->queue_lock);
-        flag = (p->runq_size <= P_RUNQ_SIZE_MAX);
+        flag = (p->runq_size < P_RUNQ_SIZE_MAX);
         pthread_mutex_unlock(&p->queue_lock);
         if (flag) {
             debug("find_runnable: P%d checking global run queue\n", p->id);
@@ -715,8 +718,8 @@ void co_wait(struct co *co) {
     assert(list_empty(&g->node)); 
     list_move(&g->node, &co->waiters);
     co->waitq_size++;
-    pthread_mutex_unlock(&co->waiters_lock);
     co_set_status(g, CO_WAITING);
+    pthread_mutex_unlock(&co->waiters_lock);
 
     
     if (setjmp(g->context) == 0) { // 保存上下文并让出 CPU
