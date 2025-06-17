@@ -12,16 +12,21 @@
     abort(); \
 } while (0)
 
+#ifdef NOASSERT
+#define assert(cond)
+#define assert_msg(cond, fmt, ...)
+#else
 #define assert(cond) do { \
     if (!(cond)) { \
         panic("assertion failed: %s\n", #cond); \
     } \
 } while (0)
-
 #define assert_msg(cond, fmt, ...) do { \
     if (!(cond)) { \
         panic("assertion failed: %s\n" fmt, #cond, ##__VA_ARGS__); \
     } \
 } while (0)
+#endif
+
 
 #endif
