@@ -43,7 +43,7 @@ static struct scheduler g_sched = {0};
 __thread struct M *current_m = NULL;
 __thread struct P *current_p = NULL;
 __thread struct co *current_g = NULL;
-__thread int is_main_thread = 0; // 是否是主线程
+__thread bool is_main_thread = false; // 是否是主线程
 
 __thread struct co *__co_wait_co = NULL; // 用于 co_wait 对象的临时传递
 
@@ -248,7 +248,10 @@ struct co* steal_work(struct P *p) {
             struct P *victim = &g_sched.all_p[perm[k]];
             if (victim == p || victim->status != P_RUNNING) continue;
 
-            pthread_mutex_lock(&victim->queue_lock);
+            if (pthread_mutex_trylock(&victim->queue_lock) != 0) {
+                // 若有竞争则跳过
+                continue;
+            }
             int n = victim->runq_size;
             if (n <= 1) {
                 pthread_mutex_unlock(&victim->queue_lock);
@@ -267,6 +270,7 @@ struct co* steal_work(struct P *p) {
                 assert(g != NULL);
                 local_runq_put(p, g);
             }
+            p->steal_count++;
             pthread_mutex_unlock(&victim->queue_lock);
             return g1;
         }
@@ -520,7 +524,7 @@ void scheduler_init(void) {
     g_sched.ndead_co = 0;
 
     // 创建 P 数组
-    g_sched.all_p = calloc(g_sched.nproc, sizeof(struct P));
+    g_sched.all_p = calloc(g_sched.nproc, sizeof(struct P)); // calloc 默认 memset 0
     if (!g_sched.all_p) {
         panic("failed to allocate P array\n");
     }
@@ -553,7 +557,7 @@ void scheduler_init(void) {
     
     debug("scheduler_init: scheduler initialized with %d P\n", g_sched.nproc);
 
-    is_main_thread = 1;
+    is_main_thread = true;
 }
 
 // 启动调度器
@@ -579,6 +583,30 @@ void scheduler_start(void) {
     debug("scheduler_start: started %d machines\n", g_sched.nproc);
 }
 
+// 输出调度信息
+void scheduler_log(void) {
+    fprintf(stderr, "\033[36m============================== Scheduler Log Begin ==============================\n");
+    fprintf(stderr, "  Total P: %3d    Total co: %3zu\n", g_sched.nproc, atomic_load(&g_sched.coid_gen));
+    uint64_t total_tick = 0;
+    uint64_t total_steal = 0;
+    pthread_mutex_lock(&g_sched.global_runq_lock);
+    fprintf(stderr, "  Global runq size: %d\n", g_sched.global_runq_size);
+    pthread_mutex_unlock(&g_sched.global_runq_lock);
+    for (int i = 0; i < g_sched.nproc; i++) {
+        struct P *p = &g_sched.all_p[i];
+        pthread_mutex_lock(&p->queue_lock);
+        fprintf(stderr, "  P%-2d: runq size %d, sched tick %zu, steal count=%zu\n", 
+                p->id, p->runq_size, p->sched_tick, p->steal_count);
+        total_tick += p->sched_tick;
+        total_steal += p->steal_count;
+        pthread_mutex_unlock(&p->queue_lock);
+    }
+    fprintf(stderr, "  TOT: sched ticks: %zu, steal count: %zu\n", total_tick, total_steal);
+
+
+    fprintf(stderr, "\033[36m=============================== Scheduler Log End ===============================\033[0m\n");
+}
+
 // 停止调度器
 void scheduler_stop(void) {
     debug("scheduler_stop: stopping scheduler\n");
@@ -597,6 +625,10 @@ void scheduler_stop(void) {
         m_destroy(m);
     }
     pthread_mutex_unlock(&g_sched.m_lock);
+    
+    if (getenv("CO_SCHED_LOG") != NULL) {
+        scheduler_log(); // 输出调度信息
+    }
     
     // 清理 P 资源
     free(g_sched.all_p);

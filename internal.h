@@ -107,6 +107,7 @@ struct P {
 
     // 调度信息
     uint64_t sched_tick; // 调度次数计数器
+    uint64_t steal_count; // 窃取次数计数器
 };
 
 
@@ -150,7 +151,7 @@ struct scheduler {
 #define COMAXPROCS_DEFAULT 4          // 默认 P 数量
 #define STACK_SIZE_DEFAULT (1024 * 1024) // 默认协程栈大小 32KB
 
-#define P_RUNQ_SIZE_MAX 4 // P 的最大运行队列大小，超出会向全局队列里丢
+#define P_RUNQ_SIZE_MAX 256 // P 的最大运行队列大小，超出会向全局队列里丢
 
 #define P_SCHED_CHECK_INTERVAL 61 // P 调度检查间隔 (每 P_SCHED_CHECK_INTERVAL 次检查是否需要调整本地队列)
 
