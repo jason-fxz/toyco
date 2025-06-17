@@ -14,6 +14,7 @@
 
 // this function is used to switch stack and start a function on the new stack
 //   ! this function never return
+__attribute__((noreturn))
 static inline void
 stack_switch_call(void *sp, void *entry, uintptr_t arg) {
     __asm__ volatile (
@@ -33,13 +34,14 @@ stack_switch_call(void *sp, void *entry, uintptr_t arg) {
             : "memory"
             #endif
     );
+    __builtin_unreachable(); // 告诉编译器这个函数不会返回
 }
 
 
 static struct scheduler g_sched = {0};
 
 __thread struct M *current_m = NULL;
-__thread struct P *current_p = NULL; 
+__thread struct P *current_p = NULL;
 __thread struct co *current_g = NULL;
 __thread int is_main_thread = 0; // 是否是主线程
 
@@ -47,16 +49,25 @@ __thread struct co *__co_wait_co = NULL; // 用于 co_wait 对象的临时传递
 
 static struct co main_co;
 
+__attribute__((noinline))
+static struct co *get_current_g(void) {
+    return current_g;
+}
+
+__attribute__((noinline))
+static void set_current_g(struct co *g) {
+    current_g = g;
+}
+
 static inline void __stack_check_canary(struct co *g) {
     assert(g != NULL);
     if (g == &main_co) return; // 主协程不检查栈
     assert(g->stack != NULL);
     // 检查栈底 canary
     uint64_t bottom_canary = *(uint64_t*)g->stack;
-    if (bottom_canary != STACK_CANARY) {
-        panic("stack_check_canary: G%ld (%s) stack bottom corruption detected! canary=0x%lx\n", 
-              g->coid, g->name, bottom_canary);
-    }
+    assert_msg(bottom_canary == STACK_CANARY, 
+               "stack_check_canary: G%ld (%s) stack bottom canary mismatch! expected=0x%lx, got=0x%lx\n", 
+               g->coid, g->name, STACK_CANARY, bottom_canary);
 }
 static void co_wrapper(struct co *g);
 void co_schedule(void);
@@ -84,9 +95,11 @@ static void local_runq_put(struct P *p, struct co *g) {
     if (!p || !g) return;
     
     pthread_mutex_lock(&p->queue_lock);
+    assert(p->runq_size == list_size(&p->run_queue));
     g->p = p;
     list_add_tail(&g->node, &p->run_queue);
     p->runq_size++;
+    assert(p->runq_size == list_size(&p->run_queue));
     pthread_mutex_unlock(&p->queue_lock);
     debug("local_runq_put: P%d <- G%ld (%s)\n", p->id, g->coid, g->name);
 }
@@ -105,6 +118,7 @@ static struct co* local_runq_get(struct P *p) {
     struct co *g = list_pop_front(&p->run_queue, struct co, node);
     p->runq_size--;
     assert(g->p == p);
+    assert(p->runq_size == list_size(&p->run_queue));
     pthread_mutex_unlock(&p->queue_lock);
     
     assert(g != NULL);
@@ -272,10 +286,11 @@ struct co* find_runnable(struct P *p) {
         bool flag = false;
         pthread_mutex_lock(&p->queue_lock);
         flag = (p->runq_size <= P_RUNQ_SIZE_MAX);
+        assert_msg(p->runq_size == list_size(&p->run_queue), "find_runnable: P%d runq_size=%d, list_size=%d\n", 
+                   p->id, p->runq_size, list_size(&p->run_queue));
         pthread_mutex_unlock(&p->queue_lock);
         if (flag) {
             debug("find_runnable: P%d checking global run queue\n", p->id);
-            assert(p->runq_size == list_size(&p->run_queue));
             assert(p->runq_size <= P_RUNQ_SIZE_MAX);
     
             pthread_mutex_lock(&g_sched.global_runq_lock);
@@ -298,8 +313,8 @@ struct co* find_runnable(struct P *p) {
     if (g) return g;
 
     // 3. 工作窃取
-    // g = steal_work(p);
-    // if (g) return g;
+    g = steal_work(p);
+    if (g) return g;
 
     return NULL;
 }
@@ -403,6 +418,7 @@ static void* m_main_loop(void *arg) {
             pthread_mutex_lock(&__co_wait_co->waiters_lock);
             if (co_get_status(__co_wait_co) == CO_DEAD) { // 已经死了, 回去
                 pthread_mutex_unlock(&__co_wait_co->waiters_lock);
+                __co_wait_co = NULL; // 清空等待协程
                 longjmp(current_g->context, 1); // 恢复到 co 的上下文
             }
             assert(list_empty(&current_g->node)); 
@@ -443,14 +459,11 @@ void co_schedule(void) {
     p->sched_tick++;    
     struct co *g = find_runnable(p);
     if (g) {
-        current_g = g;
+        set_current_g(g);
         g->p = p;
         m->cur_g = g;
 
         debug("M%d g_schedule: switching to G%ld (%s)\n", m->id, g->coid, g->name);
-
-        __stack_check_canary(g);
-
         if (co_get_status(g) == CO_NEW) {
             co_set_status(g, CO_RUNNING);
             stack_switch_call(g->stack + g->stack_size, co_wrapper, (uintptr_t)g);
@@ -693,8 +706,8 @@ void co_yield(void) {
     if (setjmp(g->context) == 0) { // 保存当前上下文
         longjmp(current_m->sched_context, CO_SCHED_YIELD); // 到 M 调度器
     } else { // 恢复执行
-        __stack_check_canary(current_g);
-        // debug("co_yield: G%ld (%s) resumed\n", g->coid, g->name);
+        __stack_check_canary(g);
+        assert(g == get_current_g()); // use get_current_g() to avoid optimization issues
     }
 }
 
@@ -705,7 +718,7 @@ void co_wait(struct co *co) {
     assert(g != NULL);
     
     if (g != &main_co) {
-        __stack_check_canary(current_g);
+        __stack_check_canary(g);
     }
 
     debug("co_wait: G%ld waiting for G%ld (%s)\n", g->coid, co->coid, co->name);
@@ -725,11 +738,10 @@ void co_wait(struct co *co) {
     
     if (setjmp(g->context) == 0) { // 保存上下文并让出 CPU
         __co_wait_co = co;
-        assert(__co_wait_co != NULL);
         longjmp(current_m->sched_context, CO_SCHED_WAIT); // 到 M 调度器
     } else { // 被唤醒，继续执行
         __stack_check_canary(g);
-        // debug("co_wait: G%ld resumed after waiting\n", g->coid);
+        assert(g == get_current_g()); 
     }
 }
 
