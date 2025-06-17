@@ -1,6 +1,7 @@
 # Tests Makefile for toyco library
 CC = clang
-CFLAGS = -std=gnu11 -g3 -Wall -Wextra -O0 -fno-omit-frame-pointer
+CFLAGS = -std=gnu11 -g3 -Wall -Wextra -O2
+DEBUG_CFLAGS = -std=gnu11 -g3 -Wall -Wextra -DDEBUG -O0 
 LDFLAGS = -L.. -lco -lpthread
 DEBUG_LDFLAGS = -L.. -lco-debug -lpthread
 
@@ -22,7 +23,7 @@ all: $(TEST_TARGETS) $(DEBUG_TARGETS) build
 	$(CC) $(CFLAGS) -I$(INC_DIR) -o $@ $< $(LDFLAGS)
 
 %.debug: %.c build
-	$(CC) $(CFLAGS) -DDEBUG -O0 -I$(INC_DIR) -o $@ $< $(DEBUG_LDFLAGS)
+	$(CC) $(DEBUG_CFLAGS) -I$(INC_DIR) -o $@ $< $(DEBUG_LDFLAGS)
 
 # 运行所有测试
 run-all: $(TEST_TARGETS)
