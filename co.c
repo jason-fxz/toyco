@@ -46,6 +46,7 @@ __thread struct co *current_g = NULL;
 __thread bool is_main_thread = false; // 是否是主线程
 
 __thread struct co *__co_wait_co = NULL; // 用于 co_wait 对象的临时传递
+__thread struct co_sem *__co_sem_wait_sem = NULL; // 用于 co_sem_wait 对象的临时传递
 
 static struct co main_co;
 
@@ -435,6 +436,12 @@ static void* m_main_loop(void *arg) {
             __co_wait_co = NULL; // 清空等待协程
         } else if (val == CO_SCHED_EXIT) { // co_exit
             // nothing to do
+        } else if (val == CO_SCHED_SEM_WAIT) { // co_sem_wait
+            assert(__co_sem_wait_sem != NULL);
+            list_add_tail(&current_g->node, &__co_sem_wait_sem->waiters);
+            co_set_status(current_g, CO_SEMWAIT);
+            pthread_mutex_unlock(&__co_sem_wait_sem->lock);
+            __co_sem_wait_sem = NULL;
         } else {
             panic("m_main_loop: unexpected jump value %d\n", val);
         }
@@ -767,7 +774,7 @@ void co_wait(struct co *co) {
     if (g == &main_co) {
         debug("main co_wait: main coroutine cannot wait, busy waiting\n");
         while (co_get_status(co) != CO_DEAD) {
-            usleep(1000); // 主线程忙等待
+            ;
         }
         debug("main co_wait: main coroutine finished waiting for G%ld\n", co->coid);
         return;
@@ -802,6 +809,44 @@ void co_free(struct co *co) {
     free(co);
 }
 
+// semaphore 相关
+void co_sem_init(struct co_sem *sem, int initial) {
+    sem->count = initial;
+    pthread_mutex_init(&sem->lock, NULL);
+    INIT_LIST_HEAD(&sem->waiters);
+}
+
+void co_sem_wait(struct co_sem *sem) {
+    pthread_mutex_lock(&sem->lock);
+    // fast path
+    sem->count--;
+    if (sem->count >= 0) {
+        pthread_mutex_unlock(&sem->lock);
+        return;
+    }
+    // slow path 放进等待队列 (在调度器中处理)
+    if (setjmp(current_g->context) == 0) {
+        __co_sem_wait_sem = sem;
+        longjmp(current_m->sched_context, CO_SCHED_SEM_WAIT);
+    } else { // 被唤醒
+        __stack_check_canary(get_current_g());
+    }
+}
+void co_sem_post(struct co_sem *sem) {
+    // fast path
+    pthread_mutex_lock(&sem->lock);
+    sem->count++;
+    if (sem->count > 0) {
+        pthread_mutex_unlock(&sem->lock);
+        return; // 成功释放信号量, 不需要唤醒等待的协程
+    }
+    // slow path, 有等待者, 唤醒一个
+    struct co *g = list_pop_front(&sem->waiters, struct co, node);
+    assert(g != NULL);
+    co_set_status(g, CO_RUNABLE);
+    runq_put(current_p, g); // 放回运行队列
+    pthread_mutex_unlock(&sem->lock);
+}
 
 __attribute__((constructor))
 static void co_init(void) {

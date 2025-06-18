@@ -19,13 +19,15 @@ enum co_status {
     CO_RUNABLE, // 可运行状态，等待调度
     CO_WAITING, // 在 co_wait 上等待
     CO_DEAD,    // 已经结束，但还未释放资源
-    CO_SYSCALL  // TODO 阻塞在系统调用，此时分配了一个 M
+    CO_SYSCALL, // TODO 阻塞在系统调用，此时分配了一个 M
+    CO_SEMWAIT, // 在信号量上等待
 };
 
 enum co_sched_type {
     CO_SCHED_YIELD = 1, // 协程让出 CPU
     CO_SCHED_WAIT,      // 协程等待其他协程结束
-    CO_SCHED_EXIT,     // 协程退出
+    CO_SCHED_EXIT,      // 协程退出
+    CO_SCHED_SEM_WAIT,  // 协程等待信号量
 };
 
 // 协程结构体 co (G)
