@@ -36,9 +36,8 @@ struct co {
     
     // 协程上下文
     jmp_buf        context; // 寄存器现场
-    
-    pthread_mutex_t lock;        // 用于保护协程状态
-    enum co_status status;       // 协程的状态
+
+    _Atomic enum co_status status;       // 协程的状态
     struct list_head node;       // 用于插入队列的节点
 
     // waiters 
@@ -56,19 +55,8 @@ struct co {
     size_t coid; // 协程的唯一 ID (coID)
 };
 
-#define co_get_status(g)  \
-    ({ \
-        pthread_mutex_lock(&((g)->lock)); \
-        enum co_status status = (g)->status; \
-        pthread_mutex_unlock(&((g)->lock)); \
-        status; \
-    })
-
-#define co_set_status(g, s) do { \
-    pthread_mutex_lock(&((g)->lock)); \
-    (g)->status = (s); \
-    pthread_mutex_unlock(&((g)->lock)); \
-} while (0)
+#define co_get_status(g)  atomic_load(&((g)->status))
+#define co_set_status(g, s) atomic_store(&((g)->status), (s))
 
 // M (Machine) - 系统线程，负责执行 G
 struct M {

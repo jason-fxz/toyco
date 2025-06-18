@@ -77,6 +77,7 @@ static size_t next_coid(void) {
 }
 
 // wrapper to handle coroutine execution
+__attribute__((noreturn))
 static void co_wrapper(struct co *g) {
     __stack_check_canary(g);
     
@@ -88,6 +89,7 @@ static void co_wrapper(struct co *g) {
     debug("co_wrapper: G%ld finished\n", g->coid);
     __stack_check_canary(g);
     co_exit(); // dead handle (mark as dead and call waiters)
+    __builtin_unreachable(); // should never reach here
 }
 
 // put g into P's local run queue
@@ -688,6 +690,7 @@ struct co* co_start(const char *name, void (*func)(void *), void *arg) {
 }
 
 // 退出当前协程
+__attribute__((noreturn))
 void co_exit() {
     __stack_check_canary(current_g);
     struct co *g = current_g;
@@ -718,6 +721,8 @@ void co_exit() {
     pthread_mutex_unlock(&g->waiters_lock);
     __stack_check_canary(current_g);
     longjmp(current_m->sched_context, CO_SCHED_EXIT); // 返回到 M 的调度器
+    // never reach here
+    __builtin_unreachable();
 }
 
 // 协程让出 CPU
