@@ -1,13 +1,16 @@
-# toyco
+# ex-toyco
 
-toy coroutine lib for c
+goroutine like toy coroutine lib for c
+support multiple coroutine on multiple threads
 
 ## APIs
 
 ```c
-struct co *co_start(const char *name, void (*func)(void *), void *arg);
+struct co* co_start(const char *name, void (*func)(void *), void *arg);
 void       co_yield();
 void       co_wait(struct co *co);
+void       co_free(struct co *co);
+void       co_exit(void);
 ```
 
 1. `co_start(name, func, arg)` 创建一个新的协程，并返回一个指向 `struct co` 的指针 (类似于 `pthread_create`)。
@@ -15,9 +18,25 @@ void       co_wait(struct co *co);
    - `co_start` 返回的 `struct co` 指针需要 `malloc()` 分配内存。
 2. `co_wait(co)` 表示当前协程需要等待，直到 `co` 协程的执行完成才能继续执行 (类似于 `pthread_join`)。
    - 允许多个协程等待同一个协程。
-   - `co` 结束时不会释放 `co` 占用的内存, `main` 函数结束时会释放所有协程占用的内存。
-3. `co_yield()` 实现协程的切换。协程运行后一直在 CPU 上执行，直到 `func` 函数返回或调用 `co_yield` 使当前运行的协程暂时放弃执行。`co_yield` 时若系统中有多个可运行的协程时 (包括当前协程)，你随机选择下一个系统中可运行的协程。
-4. `main` 函数的执行也是一个协程，因此可以在 `main` 中调用 `co_yield` 或 `co_wait`。`main` 函数返回后，无论有多少协程，进程都将直接终止。
+   - `co` 结束时不会自动释放 `co` 占用的内存, `main` 函数结束时会释放所有协程占用的内存。
+3. `co_yield()` 实现协程的切换。协程运行后一直在 CPU 上执行，直到 `func` 函数返回或调用 `co_yield` 使当前运行的协程暂时放弃执行。由调度器选择下一个要执行的协程。
+4. `co_free(co)` 显示释放 `co` 协程占用的内存。注意，`co_free` 只能在 `co` 协程结束后调用。
+5. `co_exit()` 结束当前协程的执行。
+6. `main` 函数的执行也是一个协程，因此可以在 `main` 中调用 `co_yield` 或 `co_wait`。`main` 函数返回后，无论有多少协程，进程都将直接终止。
+
+### semaphore
+
+```c
+void co_sem_init(struct co_sem *sem, int initial);
+void co_sem_wait(struct co_sem *sem);
+void co_sem_post(struct co_sem *sem);
+```
+
+协程信号量，类似于 POSIX 信号量。
+
+1. `co_sem_init(sem, initial)` 初始化信号量 `sem`，初始值为 `initial`
+2. `co_sem_wait(sem)` 阻塞当前协程，直到信号量 `sem` 的值大于 0，然后将 `sem` 的值减 1。
+3. `co_sem_post(sem)` 将信号量 `sem` 的值加 1，并唤醒一个等待该信号量的协程。
 
 ## Examples
 
@@ -42,30 +61,3 @@ int main() {
 }
 ```
 
-两个协程会交替执行，共享 counter 变量：字母是随机的 (a 或 b)，数字则从 1 到 10 递增。
-
-```plaintext
-b[1] a[2] b[3] b[4] a[5] b[6] b[7] a[8] a[9] a[10] Done
-```
-
-```cpp
-#include <stdio.h>
-#include "co.h"
-
-int count = 1; // 协程之间共享
-
-void entry(void *arg) {
-    for (int i = 0; i < 5; i++) {
-        printf("%s[%d] ", (const char *)arg, count++);
-        co_yield();
-    }
-}
-
-int main() {
-    struct co *co1 = co_start("co1", entry, "a");
-    struct co *co2 = co_start("co2", entry, "b");
-    co_wait(co1);
-    co_wait(co2);
-    printf("Done\n");
-}
-```
