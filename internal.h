@@ -56,9 +56,12 @@ struct co {
     size_t         stack_size; // 栈大小
 
     // G-P-M 模型相关字段
-    struct P *p; // 协程当前所属的 P
+    _Atomic(struct P *) p; // 协程当前所属的 P
     size_t coid; // 协程的唯一 ID (coID)
 };
+
+#define co_get_p(g)  atomic_load(&((g)->p))
+#define co_set_p(g, _p) atomic_store(&((g)->p), _p)
 
 #define co_get_status(g)  atomic_load(&((g)->status))
 #define co_set_status(g, s) atomic_store(&((g)->status), (s))
@@ -94,6 +97,8 @@ struct P {
     pthread_mutex_t queue_lock;  // 队列锁
     int runq_size;        // 运行队列大小
     
+    struct co *next_g;   // 下一个要运行的协程 G (用于 co_resume 调度)
+
     // 状态管理
     enum p_status status;        // P 的状态
     struct list_head idle_node;  // 用于插入空闲 P 列表  

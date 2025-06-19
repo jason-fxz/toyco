@@ -14,6 +14,7 @@ void co_yield();
 void co_wait(struct co *co);
 void co_free(struct co *co);
 void co_exit(void);
+void co_resume(struct co *co);
 
 // semaphore
 struct co_sem {

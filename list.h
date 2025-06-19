@@ -320,4 +320,17 @@ static inline int list_size(const struct list_head *head)
     return count;
 }
 
+static inline int list_includes(const struct list_head *head, const struct list_head *entry)
+{
+	const struct list_head *pos;
+
+	list_for_each(pos, head) {
+		if (pos == entry) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 #endif /* _LIST_H_ */
