@@ -11,6 +11,7 @@ void       co_yield();
 void       co_wait(struct co *co);
 void       co_free(struct co *co);
 void       co_exit(void);
+void       co_resume(struct co *co);
 ```
 
 1. `co_start(name, func, arg)` 创建一个新的协程，并返回一个指向 `struct co` 的指针 (类似于 `pthread_create`)。
@@ -22,7 +23,8 @@ void       co_exit(void);
 3. `co_yield()` 实现协程的切换。协程运行后一直在 CPU 上执行，直到 `func` 函数返回或调用 `co_yield` 使当前运行的协程暂时放弃执行。由调度器选择下一个要执行的协程。
 4. `co_free(co)` 显示释放 `co` 协程占用的内存。注意，`co_free` 只能在 `co` 协程结束后调用。
 5. `co_exit()` 结束当前协程的执行。
-6. `main` 函数的执行也是一个协程，因此可以在 `main` 中调用 `co_yield` 或 `co_wait`。`main` 函数返回后，无论有多少协程，进程都将直接终止。
+6. `co_resume(co)` 尝试恢复一个被 `co_yield` 暂停的协程，若成功则当前 co_yield，如果该协程已经结束或者正在等待，则恢复失败，直接返回。
+7. `main` 函数的执行也是一个协程，因此可以在 `main` 中调用 `co_yield` 或 `co_wait`。`main` 函数返回后，无论有多少协程，进程都将直接终止。
 
 ### semaphore
 
