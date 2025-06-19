@@ -15,17 +15,20 @@ int count = 0;
 struct co_sem sem_empty;
 struct co_sem sem_full;
 struct co_sem sem_mutex;
+volatile int dummy_sink;
 
 void put(int val) {
     buffer[tail] = val;
     tail = (tail + 1) % BUF_SIZE;
     count++;
+    dummy_sink = val; // 防止编译器优化
 }
 
 int get() {
     int val = buffer[head];
     head = (head + 1) % BUF_SIZE;
     count--;
+    dummy_sink = val; // 防止编译器优化
     return val;
 }
 
@@ -65,6 +68,9 @@ void consumer(void *arg) {
 }
 
 int main() {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    
     co_sem_init(&sem_empty, BUF_SIZE);
     co_sem_init(&sem_full, 0);
     co_sem_init(&sem_mutex, 1);
@@ -89,5 +95,10 @@ int main() {
     }
 
     printf("Finished. Final buffer count = %d\n", count);
+    // time cost
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double sec = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("Total time: %.3f s\n", sec);
+    
     return 0;
 }
