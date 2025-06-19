@@ -57,3 +57,7 @@ dkms.conf
 test-*
 
 .cache/*
+
+gdb.init
+compile_commands.json
+*.txt
