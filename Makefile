@@ -2,7 +2,7 @@ MODE ?= test
 NAME := libco
 CFLAGS += -U_FORTIFY_SOURCE -std=gnu11 -Wall -Wextra
 TEST_CFLAGS := -O2 -g3
-RELEASE_CFLAGS := -O2 -g3 -NOASSERT
+RELEASE_CFLAGS := -O2 -g3 -DNOASSERT
 DEBUG_CFLAGS := -DDEBUG -O0
 
 # mode 
