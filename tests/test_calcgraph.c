@@ -61,13 +61,7 @@ int main() {
     // 等待最后一层全部节点完成
     for (int w = 0; w < WIDTH; ++w) {
         co_wait(nodes[LAYERS-1][w]);
-        co_free(nodes[LAYERS-1][w]);
     }
-
-    // 释放其它层的节点
-    for (int l = 0; l < LAYERS-1; ++l)
-        for (int w = 0; w < WIDTH; ++w)
-            co_free(nodes[l][w]);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     double sec = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
