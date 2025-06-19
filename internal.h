@@ -119,6 +119,7 @@ struct scheduler {
     struct list_head global_runq;     // 全局运行队列
     pthread_mutex_t global_runq_lock; // 全局队列锁
     int global_runq_size;      // 全局运行队列大小
+    pthread_cond_t p_sleep_cond; // P 休眠条件变量
     
     // 死亡协程表
     struct list_head dead_co_list;     // 死亡协程列表
@@ -144,7 +145,7 @@ struct scheduler {
 
 // 常量定义
 #define COMAXPROCS_DEFAULT 4          // 默认 P 数量
-#define STACK_SIZE_DEFAULT (1024 * 1024) // 默认协程栈大小 32KB
+#define STACK_SIZE_DEFAULT (32 * 1024) // 默认协程栈大小 32KB
 
 #define P_RUNQ_SIZE_MAX 256 // P 的最大运行队列大小，超出会向全局队列里丢
 

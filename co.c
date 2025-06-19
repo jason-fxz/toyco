@@ -150,6 +150,7 @@ static void global_runq_put(struct co *g) {
 
     assert_msg(g_sched.global_runq_size == list_size(&g_sched.global_runq), "global_runq_put: g_sched.global_runq_size=%d, list_size=%d\n", g_sched.global_runq_size, list_size(&g_sched.global_runq));
     debug("global_runq_put: G%ld (%s)\n", g->coid, g->name);
+    pthread_cond_signal(&g_sched.p_sleep_cond);
     pthread_mutex_unlock(&g_sched.global_runq_lock);
 }
 
@@ -471,6 +472,7 @@ void co_schedule(void) {
 
     // 寻找下一个可运行的协程
     struct co *g = find_runnable(p);
+    retry:
     if (g) {
         p->sched_tick++;
         set_current_g(g);
@@ -488,7 +490,21 @@ void co_schedule(void) {
             panic("g_schedule: G%ld (%s) is not in a runnable state\n", g->coid, g->name);
         }
     } 
-    // 没有可运行的协程，返回到 M 的主循环
+    // 没有可运行的协程,休眠，直到有新的协程加入
+    pthread_mutex_lock(&g_sched.global_runq_lock);
+    while (g_sched.global_runq_size == 0 && !atomic_load(&g_sched.stop_the_world)) {
+        debug("M%d g_schedule: no runnable G, M%d going to sleep\n", m->id, m->id);
+        pthread_cond_wait(&g_sched.p_sleep_cond, &g_sched.global_runq_lock);
+    }
+    if (atomic_load(&g_sched.stop_the_world)) {
+        pthread_mutex_unlock(&g_sched.global_runq_lock);
+        debug("M%d g_schedule: stop the world signal received, exiting\n", m->id);
+        return; // 停止调度
+    }
+    debug("M%d g_schedule: woke up, checking global run queue\n", m->id);
+    g = global_runq_get(p, 0);
+    pthread_mutex_unlock(&g_sched.global_runq_lock);
+    goto retry;
     debug("M%d g_schedule: no runnable G found\n", m->id);
 }
 
@@ -513,6 +529,7 @@ void scheduler_init(void) {
     INIT_LIST_HEAD(&g_sched.global_runq);
     pthread_mutex_init(&g_sched.global_runq_lock, NULL);
     g_sched.global_runq_size = 0;
+    pthread_cond_init(&g_sched.p_sleep_cond, NULL);
     
     // 初始化空闲 P 列表
     INIT_LIST_HEAD(&g_sched.idle_p_list);
@@ -630,6 +647,11 @@ void scheduler_stop(void) {
     
     atomic_store(&g_sched.stop_the_world, true);
     
+    // 唤醒所有 M 的调度器
+    pthread_mutex_lock(&g_sched.global_runq_lock);
+    pthread_cond_broadcast(&g_sched.p_sleep_cond);
+    pthread_mutex_unlock(&g_sched.global_runq_lock);
+
     // 等待所有 M 结束
     struct M *m, *tmp;
     pthread_mutex_lock(&g_sched.m_lock);
