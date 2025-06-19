@@ -37,23 +37,25 @@ struct co {
     void (*func)(void *); // co_start 指定的入口地址和参数
     void *arg;
     
-    // 协程上下文
-    jmp_buf        context; // 寄存器现场
+    // main 协程等待
+    pthread_cond_t main_wait_cond;
+    pthread_mutex_t main_wait_lock;
 
+    // 协程状态
     _Atomic enum co_status status;       // 协程的状态
     struct list_head node;       // 用于插入队列的节点
-
+    
     // waiters 
     struct list_head waiters;    // 等待该协程的协程列表
     pthread_mutex_t waiters_lock; // 等待队列锁
     int waitq_size;       // 等待队列大小
-    
-
+        
+    // 协程上下文
+    jmp_buf        context; // 寄存器现场
     uint8_t        *stack;  // 协程的栈
     size_t         stack_size; // 栈大小
 
     // G-P-M 模型相关字段
-    // struct M *m; // 协程当前所属的 M
     struct P *p; // 协程当前所属的 P
     size_t coid; // 协程的唯一 ID (coID)
 };
@@ -147,7 +149,7 @@ struct scheduler {
 #define COMAXPROCS_DEFAULT 4          // 默认 P 数量
 #define STACK_SIZE_DEFAULT (32 * 1024) // 默认协程栈大小 32KB
 
-#define P_RUNQ_SIZE_MAX 256 // P 的最大运行队列大小，超出会向全局队列里丢
+#define P_RUNQ_SIZE_MAX 128 // P 的最大运行队列大小，超出会向全局队列里丢
 
 #define P_SCHED_CHECK_INTERVAL 61 // P 调度检查间隔 (每 P_SCHED_CHECK_INTERVAL 次检查是否需要调整本地队列)
 

@@ -715,8 +715,12 @@ struct co* co_start(const char *name, void (*func)(void *), void *arg) {
         panic("failed to allocate stack for coroutine\n");
         return NULL;
     }
-    
-    // // 在栈底部添加 canary 值用于检测栈溢出
+
+    // main 协程等待条件变量
+    pthread_cond_init(&g->main_wait_cond, NULL);
+    pthread_mutex_init(&g->main_wait_lock, NULL);
+
+    // 在栈底部添加 canary 值用于检测栈溢出
     *(uint64_t*)g->stack = 0xDEADBEEFCAFEBABE;
 
     debug("co_start: created G%ld (%s)\n", g->coid, g->name);
@@ -743,6 +747,11 @@ void co_exit() {
     list_add_tail(&g->node, &g_sched.dead_co_list);
     g_sched.ndead_co++;
     pthread_mutex_unlock(&g_sched.dead_co_lock);
+
+    // wake up main coroutine if waiting
+    pthread_mutex_lock(&g->main_wait_lock);
+    pthread_cond_broadcast(&g->main_wait_cond);
+    pthread_mutex_unlock(&g->main_wait_lock);
 
     // call waiters
     struct co *entry, *tmp;
@@ -800,12 +809,14 @@ void co_wait(struct co *co) {
         debug("co_wait: G%ld already dead\n", co->coid);
         return;
     }
-    // main 主线程特判，现在就忙等待 TODO： 唤醒
+    // main 主线程特判，条件变量唤醒
     if (g == &main_co) {
         debug("main co_wait: main coroutine cannot wait, busy waiting\n");
+        pthread_mutex_lock(&co->main_wait_lock);
         while (co_get_status(co) != CO_DEAD) {
-            ;
+            pthread_cond_wait(&co->main_wait_cond, &co->main_wait_lock);
         }
+        pthread_mutex_unlock(&co->main_wait_lock);
         debug("main co_wait: main coroutine finished waiting for G%ld\n", co->coid);
         return;
     }
