@@ -3,9 +3,10 @@
 #include "co.h"
 
 #define BUF_SIZE 10
-#define N_PRODUCE 10
-#define N_PRODUCER 40
-#define N_CONSUMER 40
+#define N_PRODUCE 100
+#define N_PRODUCER 400
+#define N_CONSUMER 400
+
 
 int buffer[BUF_SIZE];
 int head = 0, tail = 0;
@@ -36,8 +37,9 @@ void producer(void *arg) {
 
         int val = id * 1000 + i;
         put(val);
+        #ifdef PRINT
         printf("[P%d] produce %d\n", id, val);
-
+        #endif
         co_sem_post(&sem_mutex);
         co_sem_post(&sem_full);
         co_yield();
@@ -52,8 +54,9 @@ void consumer(void *arg) {
         co_sem_wait(&sem_mutex);
 
         int val = get();
+        #ifdef PRINT
         printf("        [C%d] consume %d\n", id, val);
-
+        #endif
         co_sem_post(&sem_mutex);
         co_sem_post(&sem_empty);
         co_yield();
