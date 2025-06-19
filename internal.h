@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <time.h>
 
 enum co_status {
     CO_NEW = 1, // 新创建，还未执行过
@@ -134,6 +135,10 @@ struct scheduler {
     
     // 协程 ID 分配
     atomic_size_t coid_gen;           // 协程 ID 生成器
+
+    // 调度信息
+    uint64_t global_enqueue_count;    // 全局入队次数计数
+    struct timespec start_time;       // 调度器启动时间
 };
 
 

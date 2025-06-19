@@ -143,6 +143,7 @@ static void global_runq_put(struct co *g) {
         assert(g_sched.global_runq.next == &g_sched.global_runq);
         assert(g_sched.global_runq.prev == &g_sched.global_runq);
     }
+    g_sched.global_enqueue_count++;
                
     list_add_tail(&g->node, &g_sched.global_runq);
     g_sched.global_runq_size++;
@@ -440,7 +441,7 @@ static void* m_main_loop(void *arg) {
             assert(__co_sem_wait_sem != NULL);
             list_add_tail(&current_g->node, &__co_sem_wait_sem->waiters);
             co_set_status(current_g, CO_SEMWAIT);
-            pthread_mutex_unlock(&__co_sem_wait_sem->lock);
+            pthread_spin_unlock(&__co_sem_wait_sem->lock);
             __co_sem_wait_sem = NULL;
         } else {
             panic("m_main_loop: unexpected jump value %d\n", val);
@@ -469,9 +470,9 @@ void co_schedule(void) {
     }
 
     // 寻找下一个可运行的协程
-    p->sched_tick++;    
     struct co *g = find_runnable(p);
     if (g) {
+        p->sched_tick++;
         set_current_g(g);
         g->p = p;
         m->cur_g = g;
@@ -531,6 +532,10 @@ void scheduler_init(void) {
     INIT_LIST_HEAD(&g_sched.dead_co_list);
     pthread_mutex_init(&g_sched.dead_co_lock, NULL);
     g_sched.ndead_co = 0;
+
+    // 初始化调度信息
+    g_sched.global_enqueue_count = 0;
+    clock_gettime(CLOCK_MONOTONIC, &g_sched.start_time);
 
     // 创建 P 数组
     g_sched.all_p = calloc(g_sched.nproc, sizeof(struct P)); // calloc 默认 memset 0
@@ -594,12 +599,15 @@ void scheduler_start(void) {
 
 // 输出调度信息
 void scheduler_log(void) {
-    fprintf(stderr, "\033[36m============================== Scheduler Log Begin ==============================\n");
-    fprintf(stderr, "  Total P: %3d    Total co: %3zu\n", g_sched.nproc, atomic_load(&g_sched.coid_gen));
     uint64_t total_tick = 0;
     uint64_t total_steal = 0;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    fprintf(stderr, "\033[36m============================== Scheduler Log Begin ==============================\n");
+    fprintf(stderr, "  Time: %.3f ms\n", get_elapsed_time(&g_sched.start_time, &now));
+    fprintf(stderr, "  Total P: %d    Total co: %zu\n", g_sched.nproc, atomic_load(&g_sched.coid_gen));
     pthread_mutex_lock(&g_sched.global_runq_lock);
-    fprintf(stderr, "  Global runq size: %d\n", g_sched.global_runq_size);
+    fprintf(stderr, "  Global runq size: %d  enqueue count: %zu\n", g_sched.global_runq_size, g_sched.global_enqueue_count);
     pthread_mutex_unlock(&g_sched.global_runq_lock);
     for (int i = 0; i < g_sched.nproc; i++) {
         struct P *p = &g_sched.all_p[i];
@@ -812,16 +820,16 @@ void co_free(struct co *co) {
 // semaphore 相关
 void co_sem_init(struct co_sem *sem, int initial) {
     sem->count = initial;
-    pthread_mutex_init(&sem->lock, NULL);
+    pthread_spin_init(&sem->lock, 0);
     INIT_LIST_HEAD(&sem->waiters);
 }
 
 void co_sem_wait(struct co_sem *sem) {
-    pthread_mutex_lock(&sem->lock);
+    pthread_spin_lock(&sem->lock);
     // fast path
     sem->count--;
     if (sem->count >= 0) {
-        pthread_mutex_unlock(&sem->lock);
+        pthread_spin_unlock(&sem->lock);
         return;
     }
     // slow path 放进等待队列 (在调度器中处理)
@@ -834,10 +842,10 @@ void co_sem_wait(struct co_sem *sem) {
 }
 void co_sem_post(struct co_sem *sem) {
     // fast path
-    pthread_mutex_lock(&sem->lock);
+    pthread_spin_lock(&sem->lock);
     sem->count++;
     if (sem->count > 0) {
-        pthread_mutex_unlock(&sem->lock);
+        pthread_spin_unlock(&sem->lock);
         return; // 成功释放信号量, 不需要唤醒等待的协程
     }
     // slow path, 有等待者, 唤醒一个
@@ -845,7 +853,7 @@ void co_sem_post(struct co_sem *sem) {
     assert(g != NULL);
     co_set_status(g, CO_RUNABLE);
     runq_put(current_p, g); // 放回运行队列
-    pthread_mutex_unlock(&sem->lock);
+    pthread_spin_unlock(&sem->lock);
 }
 
 __attribute__((constructor))

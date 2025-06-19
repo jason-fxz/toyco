@@ -19,7 +19,7 @@ void co_exit(void);
 struct co_sem {
     int count;
     struct list_head waiters;
-    pthread_mutex_t lock;
+    pthread_spinlock_t lock;
 };
 void co_sem_init(struct co_sem *sem, int initial);
 void co_sem_wait(struct co_sem *sem);
